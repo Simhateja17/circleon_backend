@@ -19,3 +19,9 @@ The relevant API routes are:
 - `POST /api/auth/otp/verify` with `{ email, token }`
 - `GET /api/auth/google` for Google OAuth
 - `POST /api/auth/logout`
+
+## API logs
+
+Every failed `/api/*` request is logged by PM2 with a request ID, endpoint, status, duration, origin, and returned error message. Tokens, cookies, and request bodies are not logged.
+
+Set `LOG_API_REQUESTS=true` in the backend environment to also log successful API requests while debugging. Leave it `false` in normal production operation.

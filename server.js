@@ -11,6 +11,7 @@ const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
+const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -18,22 +19,7 @@ const frontendOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = [frontendOrigin, 'http://localhost:3000', 'http://localhost:3001'];
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.use((req, res, next) => {
-  const startedAt = Date.now();
-  res.on('finish', () => {
-    if (res.statusCode >= 400) {
-      console.warn(JSON.stringify({
-        event: 'http_error',
-        method: req.method,
-        path: req.originalUrl,
-        status: res.statusCode,
-        origin: req.headers.origin || null,
-        durationMs: Date.now() - startedAt,
-      }));
-    }
-  });
-  next();
-});
+app.use(apiRequestLogger);
 app.use((req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
 
@@ -56,6 +42,8 @@ app.use('/api/outcomes', outcomeRoutes);
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
+
+app.use(apiErrorHandler);
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
