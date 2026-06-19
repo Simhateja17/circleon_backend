@@ -14,6 +14,12 @@ async function requireAuth(req, res, next) {
   const token = cookies[ACCESS_COOKIE] || bearerToken;
 
   if (!token && !cookies[REFRESH_COOKIE]) {
+    console.warn(JSON.stringify({
+      event: 'auth_cookie_missing',
+      method: req.method,
+      path: req.originalUrl,
+      origin: req.headers.origin || null,
+    }));
     return res.status(401).json({ error: 'Authentication required' });
   }
 
@@ -34,6 +40,12 @@ async function requireAuth(req, res, next) {
   }
 
   if (error || !data.user) {
+    console.warn(JSON.stringify({
+      event: 'auth_session_invalid',
+      method: req.method,
+      path: req.originalUrl,
+      error: error?.message || 'User missing',
+    }));
     clearAuthCookies(res);
     return res.status(401).json({ error: 'Invalid or expired session' });
   }

@@ -55,6 +55,7 @@ At minimum set:
 - `PORT=5001`
 - `FRONTEND_URL` — your deployed frontend origin
 - `APP_PUBLIC_URL` / `API_PUBLIC_URL` — your public API domain
+- `AUTH_COOKIE_SAME_SITE=None` when the frontend and API use different sites/domains
 - Supabase keys
 - Apollo, Retell, Gemini keys as needed
 

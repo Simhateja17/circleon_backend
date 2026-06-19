@@ -55,6 +55,13 @@ router.post('/otp/request', async (req, res) => {
   });
 
   if (error) {
+    console.error(JSON.stringify({
+      event: 'otp_request_failed',
+      intent,
+      error: error.message,
+      code: error.code || null,
+      status: error.status || null,
+    }));
     return res.status(400).json({ error: error.message });
   }
 
@@ -80,10 +87,17 @@ router.post('/otp/verify', async (req, res) => {
   });
 
   if (error || !data.session) {
+    console.warn(JSON.stringify({
+      event: 'otp_verify_failed',
+      error: error?.message || 'Session missing after OTP verification',
+      code: error?.code || null,
+      status: error?.status || null,
+    }));
     return res.status(401).json({ error: error?.message || 'Invalid or expired code' });
   }
 
   setSessionCookies(res, data.session);
+  console.info(JSON.stringify({ event: 'otp_verify_succeeded', userId: data.user?.id || null }));
 
   return res.json({
     message: 'Authentication successful',

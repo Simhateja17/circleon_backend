@@ -18,6 +18,22 @@ const allowedOrigins = [frontendOrigin, 'http://localhost:3000', 'http://localho
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    if (res.statusCode >= 400) {
+      console.warn(JSON.stringify({
+        event: 'http_error',
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        origin: req.headers.origin || null,
+        durationMs: Date.now() - startedAt,
+      }));
+    }
+  });
+  next();
+});
+app.use((req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
 
   const origin = req.headers.origin;
