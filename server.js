@@ -10,6 +10,7 @@ const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
 const { startCallingQueue } = require('./lib/callingQueue');
+const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -59,4 +60,7 @@ app.get('/api/health', (_req, res) => {
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   startCallingQueue();
+  resumeQueuedAgentLaunchJobs().catch(error => {
+    console.error('[agent-launch-recovery] failed', error);
+  });
 });

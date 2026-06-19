@@ -55,7 +55,7 @@ router.get('/meetings', async (req, res) => {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const { data, error } = await req.supabase
       .from('meetings')
-      .select('*, leads(full_name, company_name, email, phone), calls(outcome_type, summary)')
+      .select('*, leads(full_name, company_name, email, phone), calls!meetings_call_id_fkey(outcome_type, summary)')
       .eq('workspace_id', workspace.id)
       .order('created_at', { ascending: false })
       .limit(100);
@@ -63,6 +63,7 @@ router.get('/meetings', async (req, res) => {
     if (error) throw error;
     return res.json({ meetings: data || [] });
   } catch (error) {
+    console.error('[meetings-list] failed', error);
     return res.status(500).json({ error: error.message || 'Failed to load meetings' });
   }
 });

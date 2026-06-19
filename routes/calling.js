@@ -87,7 +87,7 @@ router.get('/status', async (req, res) => {
         .in('status', ['queued', 'calling', 'ringing', 'in_progress']),
       req.supabase
         .from('calls')
-        .select('*, leads(full_name, company_name, phone), follow_ups(title), call_outcomes(outcome_type, confidence, next_action, meeting_requested), meetings(id, status, starts_at, booking_url)')
+        .select('*, leads(full_name, company_name, phone), follow_ups(title), call_outcomes(outcome_type, confidence, next_action, meeting_requested), meetings!calls_meeting_id_fkey(id, status, starts_at, booking_url)')
         .eq('workspace_id', workspace.id)
         .order('created_at', { ascending: false })
         .limit(20),
@@ -111,6 +111,7 @@ router.get('/status', async (req, res) => {
       calls: calls || [],
     });
   } catch (error) {
+    console.error('[calling-status] failed', error);
     return res.status(500).json({ error: error.message || 'Failed to load calling status' });
   }
 });
