@@ -2,7 +2,7 @@
 
 ## Email OTP authentication
 
-Email authentication is passwordless. The frontend requests and verifies a six-digit code through Express; Express stores the resulting Supabase access and refresh tokens in HTTP-only cookies.
+Email authentication is passwordless. The frontend requests and verifies a verification code through Express; Express stores the resulting Supabase access and refresh tokens in HTTP-only cookies.
 
 For hosted Supabase, configure **Authentication → Email Templates → Magic Link** to send a code rather than a link. The template must use `{{ .Token }}` and must not use `{{ .ConfirmationURL }}`. For example:
 

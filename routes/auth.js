@@ -59,7 +59,7 @@ router.post('/otp/request', async (req, res) => {
   }
 
   return res.json({
-    message: 'If this email can be used here, a six-digit code has been sent.',
+    message: 'If this email can be used here, a verification code has been sent.',
     otpSent: true,
   });
 });
@@ -69,8 +69,8 @@ router.post('/otp/verify', async (req, res) => {
   const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const token = typeof req.body.token === 'string' ? req.body.token.trim() : '';
 
-  if (!email || !/^\d{6}$/.test(token)) {
-    return res.status(400).json({ error: 'Email and a six-digit code are required' });
+  if (!email || !/^\d{6,10}$/.test(token)) {
+    return res.status(400).json({ error: 'Email and a verification code are required' });
   }
 
   const { data, error } = await supabase.auth.verifyOtp({
