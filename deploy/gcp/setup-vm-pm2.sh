@@ -18,8 +18,8 @@ apt-get update
 apt-get upgrade -y
 apt-get install -y ca-certificates curl gnupg git rsync lsb-release
 
-echo "==> Installing Node.js 20 LTS"
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+echo "==> Installing Node.js 22 LTS"
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y nodejs
 
 echo "==> Installing PM2 globally"
@@ -27,7 +27,7 @@ npm install -g pm2
 
 echo "==> Installing Caddy"
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 apt-get update
 apt-get install -y caddy
@@ -40,6 +40,7 @@ mkdir -p "${APP_DIR}" "${LOG_DIR}"
 
 # Copy deployment artifacts from this script's directory so Caddy and PM2 configs
 # are available even before the first code deploy.
+mkdir -p "${APP_DIR}/deploy/gcp"
 rsync -avz "${SCRIPT_DIR}/" "${APP_DIR}/deploy/gcp/"
 
 chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}" "${LOG_DIR}"

@@ -18,23 +18,39 @@ function authCallbackUrl() {
   return `${API_PUBLIC_URL}/api/auth/callback`;
 }
 
-// POST /api/auth/signup
-router.post('/signup', async (req, res) => {
-  const { email, password, fullName, businessName, phone } = req.body;
+// POST /api/auth/otp/request
+router.post('/otp/request', async (req, res) => {
+  const {
+    email: rawEmail,
+    intent,
+    fullName,
+    businessName,
+    phone,
+  } = req.body;
+  const email = typeof rawEmail === 'string' ? rawEmail.trim().toLowerCase() : '';
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+  if (!email || !['login', 'signup'].includes(intent)) {
+    return res.status(400).json({ error: 'A valid email and intent are required' });
   }
 
-  const { data, error } = await supabase.auth.signUp({
+  const isSignup = intent === 'signup';
+  if (isSignup && (!fullName?.trim() || !businessName?.trim())) {
+    return res.status(400).json({ error: 'Full name and business name are required' });
+  }
+
+  const { error } = await supabase.auth.signInWithOtp({
     email,
-    password,
     options: {
-      data: {
-        full_name: fullName || '',
-        business_name: businessName || '',
-        phone: phone || '',
-      },
+      shouldCreateUser: isSignup,
+      ...(isSignup
+        ? {
+            data: {
+              full_name: fullName.trim(),
+              business_name: businessName.trim(),
+              phone: typeof phone === 'string' ? phone.trim() : '',
+            },
+          }
+        : {}),
     },
   });
 
@@ -42,36 +58,35 @@ router.post('/signup', async (req, res) => {
     return res.status(400).json({ error: error.message });
   }
 
-  setSessionCookies(res, data.session);
-
   return res.json({
-    message: 'Signup successful. Please check your email to confirm your account.',
-    user: data.user,
-    authenticated: Boolean(data.session),
+    message: 'If this email can be used here, a six-digit code has been sent.',
+    otpSent: true,
   });
 });
 
-// POST /api/auth/login
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+// POST /api/auth/otp/verify
+router.post('/otp/verify', async (req, res) => {
+  const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const token = typeof req.body.token === 'string' ? req.body.token.trim() : '';
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+  if (!email || !/^\d{6}$/.test(token)) {
+    return res.status(400).json({ error: 'Email and a six-digit code are required' });
   }
 
-  const { data, error } = await supabase.auth.signInWithPassword({
+  const { data, error } = await supabase.auth.verifyOtp({
     email,
-    password,
+    token,
+    type: 'email',
   });
 
-  if (error) {
-    return res.status(401).json({ error: error.message });
+  if (error || !data.session) {
+    return res.status(401).json({ error: error?.message || 'Invalid or expired code' });
   }
 
   setSessionCookies(res, data.session);
 
   return res.json({
-    message: 'Login successful',
+    message: 'Authentication successful',
     user: data.user,
     authenticated: true,
   });
