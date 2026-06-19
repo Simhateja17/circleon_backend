@@ -1,0 +1,12 @@
+# Reference reverse-proxy config for barsha-backend.
+# setup-vm-pm2.sh generates /etc/caddy/Caddyfile from this pattern,
+# but you can edit this file directly if you prefer to manage Caddy yourself.
+
+api.example.com {
+	reverse_proxy localhost:5001
+}
+
+# Fallback HTTP site when no domain is configured.
+:80 {
+	reverse_proxy localhost:5001
+}
