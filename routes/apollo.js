@@ -2,20 +2,27 @@ const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { createServiceClient } = require('../lib/supabase');
 const { getOrCreateWorkspace } = require('../lib/workspace');
-const { normalizeLead, upsertLeadWithContext } = require('./leads');
+const { getLeadImportQueue } = require('../lib/redis');
+const { findExistingLead, normalizeLead, upsertLeadWithContext, usableEmail } = require('./leads');
 const {
   APOLLO_BLOCK_REASON,
   apolloPersonId,
   buildDefaultFilters,
+  enrichOrganizationForPerson,
   extractWebhookUpdates,
-  getWebhookUrl,
   normalizeApolloLead,
   normalizeFilters,
+  pollWebhookResult,
   requestBulkEnrichment,
   searchPeople,
 } = require('../lib/apollo');
 
 const router = express.Router();
+
+function debug(event, details = {}) {
+  if (process.env.APOLLO_DEBUG === 'false') return;
+  console.log(`[apollo:${event}]`, JSON.stringify(details));
+}
 
 function mergeRawData(existing = {}, patch = {}) {
   return {
@@ -73,6 +80,224 @@ async function recordEnrichmentRequests(supabase, workspaceId, importRunId, batc
     onConflict: 'workspace_id,apollo_person_id',
   });
   if (error) throw error;
+  debug('enrichment_requests_recorded', {
+    importRunId,
+    rows: rows.length,
+    requestIds: [...new Set(rows.map(row => row.apollo_request_id).filter(Boolean))].map(id => id.slice(-8)),
+  });
+}
+
+async function findLeadForApolloUpdate(supabase, item) {
+  if (item.requestId) {
+    let requestQuery = supabase
+      .from('apollo_enrichment_requests')
+      .select('lead_id')
+      .eq('apollo_request_id', item.requestId);
+    if (item.personId) requestQuery = requestQuery.eq('apollo_person_id', item.personId);
+    const { data: requests, error: requestError } = await requestQuery.limit(1);
+    if (requestError) throw requestError;
+    if (requests?.[0]?.lead_id) {
+      const { data, error } = await supabase.from('leads').select('*').eq('id', requests[0].lead_id).maybeSingle();
+      if (error) throw error;
+      if (data) return data;
+    }
+  }
+
+  // Apollo person IDs are not tenant-specific. If the webhook omits our request
+  // ID, only accept an unambiguous pending request rather than searching the
+  // shared leads table and risking a cross-workspace update.
+  if (item.personId) {
+    const { data: requests, error: requestError } = await supabase
+      .from('apollo_enrichment_requests')
+      .select('lead_id')
+      .eq('apollo_person_id', item.personId)
+      .eq('status', 'pending')
+      .limit(2);
+    if (requestError) throw requestError;
+    if (requests?.length === 1) {
+      const { data, error } = await supabase.from('leads').select('*').eq('id', requests[0].lead_id).maybeSingle();
+      if (error) throw error;
+      return data || null;
+    }
+  }
+
+  return null;
+}
+
+async function requestNextEnrichmentBatch(supabase, run) {
+  const target = Number(run.raw_meta?.requested_limit || run.total_rows || 0);
+  const cap = Number(run.raw_meta?.candidate_cap || Math.min(target * 3, 300));
+  const [{ data: candidates, error: candidateError }, { data: requests, error: requestError }] = await Promise.all([
+    supabase.from('leads').select('id, external_id, raw_data').eq('import_run_id', run.id).eq('lifecycle_status', 'enriching').limit(cap),
+    supabase.from('apollo_enrichment_requests').select('lead_id').eq('import_run_id', run.id),
+  ]);
+  if (candidateError) throw candidateError;
+  if (requestError) throw requestError;
+  const requestedLeadIds = new Set((requests || []).map(row => row.lead_id));
+  const next = (candidates || []).filter(lead => !requestedLeadIds.has(lead.id)).slice(0, 10);
+  const people = next.map(lead => lead.raw_data?.apollo?.searchPerson).filter(Boolean);
+  if (!people.length) return { requested: 0, requestIds: [] };
+  const leadByPersonId = new Map(next.map(lead => [lead.external_id, lead.id]));
+  const batches = await requestBulkEnrichment(people, run.id);
+  await recordEnrichmentRequests(supabase, run.workspace_id, run.id, batches, leadByPersonId);
+  return { requested: people.length, requestIds: batches.map(batch => batch.request_id).filter(Boolean) };
+}
+
+async function applyApolloUpdates(supabase, updates) {
+  let updated = 0;
+  let skipped = 0;
+  const touchedRuns = new Set();
+
+  for (const item of updates) {
+    const lead = await findLeadForApolloUpdate(supabase, item);
+    if (!lead) {
+      skipped += 1;
+      debug('update_skipped_no_lead_match', {
+        hasPersonId: Boolean(item.personId),
+        hasEmail: Boolean(item.email),
+        hasPhone: Boolean(item.phone),
+      });
+      continue;
+    }
+
+    const canUseApolloEmail = !lead.email || lead.email_source === 'apollo';
+    const canonicalEmail = canUseApolloEmail ? item.email : lead.email;
+    const emailReady = usableEmail(canonicalEmail);
+    const patch = {
+      raw_data: mergeRawData(lead.raw_data, {
+        enrichmentWebhook: item.raw,
+        enrichment_status: emailReady ? 'completed' : 'not_found',
+      }),
+      callable_block_reason: emailReady ? null : (lead.callable_block_reason || APOLLO_BLOCK_REASON),
+      lifecycle_status: emailReady ? 'ready' : 'rejected_no_email',
+      enrichment_status: emailReady ? 'completed' : 'failed',
+      last_enriched_at: new Date().toISOString(),
+      rejection_reason: emailReady ? null : 'Apollo returned no usable work email',
+    };
+    if (item.email && canUseApolloEmail) {
+      patch.email = item.email;
+      patch.email_status = 'verified';
+      patch.email_source = 'apollo';
+      patch.email_updated_at = new Date().toISOString();
+    }
+    if (item.phone) patch.phone = item.phone;
+    if (item.phone_e164) patch.phone_e164 = item.phone_e164;
+
+    const { error: updateError } = await supabase
+      .from('leads')
+      .update(patch)
+      .eq('id', lead.id);
+    if (updateError) throw updateError;
+
+    if (item.email) {
+      await supabase.from('lead_enrichment_history').insert({
+        workspace_id: lead.workspace_id,
+        lead_id: lead.id,
+        provider: 'apollo_waterfall',
+        field_name: 'email',
+        previous_value: lead.email || null,
+        discovered_value: item.email,
+        selected_as_canonical: canUseApolloEmail,
+        confidence: 'verified',
+        raw_response: item.raw || {},
+      });
+    }
+
+    await supabase
+      .from('apollo_enrichment_requests')
+      .update({
+        status: emailReady ? 'completed' : 'failed',
+        raw_response: item.raw,
+        error_message: emailReady ? null : 'Apollo returned no usable work email',
+        completed_at: new Date().toISOString(),
+      })
+      .eq('lead_id', lead.id);
+
+    if (lead.import_run_id) touchedRuns.add(lead.import_run_id);
+    updated += 1;
+    debug('lead_contact_updated', {
+      leadId: lead.id,
+      hasEmail: Boolean(item.email),
+      hasPhone: Boolean(item.phone),
+      status: item.hasContactData ? 'completed' : 'failed',
+    });
+  }
+
+  for (const runId of touchedRuns) {
+    const { data: run } = await supabase
+      .from('lead_import_runs')
+      .select('*')
+      .eq('id', runId)
+      .maybeSingle();
+
+    if (run) {
+      const [{ count: readyCount }, { count: pendingCount }] = await Promise.all([
+        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('import_run_id', runId).eq('lifecycle_status', 'ready'),
+        supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('import_run_id', runId).eq('status', 'pending'),
+      ]);
+      const target = Number(run.raw_meta?.requested_limit || run.total_rows || 0);
+      const ready = readyCount || 0;
+      const pending = pendingCount || 0;
+      const shouldTopUp = !pending && ready < target;
+      const topUp = shouldTopUp ? await requestNextEnrichmentBatch(supabase, run) : { requested: 0, requestIds: [] };
+      const hasMore = topUp.requested > 0;
+      if (!pending && ready >= target) {
+        await supabase.from('leads').update({ lifecycle_status: 'candidate', enrichment_status: 'not_started' })
+          .eq('import_run_id', runId).eq('lifecycle_status', 'enriching');
+      }
+      await updateImportRun(supabase, runId, {
+        status: (pending || hasMore) ? 'pending_enrichment' : (ready >= target ? 'completed' : 'partial'),
+        completed_at: (pending || hasMore) ? null : new Date().toISOString(),
+        raw_meta: {
+          ...(run.raw_meta || {}),
+          enrichment_status: 'webhook_received',
+          webhook_updated_count: ((run.raw_meta || {}).webhook_updated_count || 0) + updated,
+          last_webhook_at: new Date().toISOString(),
+          ready_count: ready,
+          pending_count: pending,
+          latest_top_up_request_ids: topUp.requestIds,
+        },
+      });
+    }
+  }
+
+  return { updated, skipped };
+}
+
+async function pollAndApplyApolloRequests(supabase, requestIds) {
+  let updated = 0;
+  let skipped = 0;
+  let pending = 0;
+
+  for (const requestId of requestIds.filter(Boolean)) {
+    try {
+      const payload = await pollWebhookResult(requestId);
+      const updates = extractWebhookUpdates(payload || {});
+      if (!updates.length) {
+        pending += 1;
+        debug('poll_result_pending_or_empty', {
+          requestIdSuffix: requestId.slice(-8),
+        });
+        continue;
+      }
+      debug('poll_result_updates_extracted', {
+        requestIdSuffix: requestId.slice(-8),
+        updates: updates.length,
+        withEmail: updates.filter(update => Boolean(update.email)).length,
+      });
+      const result = await applyApolloUpdates(supabase, updates);
+      updated += result.updated;
+      skipped += result.skipped;
+    } catch (error) {
+      pending += 1;
+      debug('poll_result_failed', {
+        requestIdSuffix: requestId.slice(-8),
+        error: error.message,
+      });
+    }
+  }
+
+  return { updated, skipped, pending };
 }
 
 router.post('/webhook', async (req, res) => {
@@ -83,86 +308,8 @@ router.post('/webhook', async (req, res) => {
     }
 
     const updates = extractWebhookUpdates(req.body || {});
-    let updated = 0;
-    let skipped = 0;
-    const touchedRuns = new Set();
-
-    for (const item of updates) {
-      let query = service
-        .from('leads')
-        .select('*')
-        .eq('source', 'apollo')
-        .limit(1);
-
-      if (item.personId) {
-        query = query.eq('external_id', item.personId);
-      } else if (item.email) {
-        query = query.eq('email', item.email);
-      } else if (item.phone) {
-        query = query.eq('phone', item.phone);
-      } else {
-        skipped += 1;
-        continue;
-      }
-
-      const { data: matches, error: matchError } = await query;
-      if (matchError) throw matchError;
-      const lead = matches?.[0];
-      if (!lead) {
-        skipped += 1;
-        continue;
-      }
-
-      const patch = {
-        raw_data: mergeRawData(lead.raw_data, {
-          enrichmentWebhook: item.raw,
-          enrichment_status: 'completed',
-        }),
-        callable_block_reason: lead.callable_block_reason || APOLLO_BLOCK_REASON,
-      };
-      if (item.email) patch.email = item.email;
-      if (item.phone) patch.phone = item.phone;
-      if (item.phone_e164) patch.phone_e164 = item.phone_e164;
-
-      const { error: updateError } = await service
-        .from('leads')
-        .update(patch)
-        .eq('id', lead.id);
-      if (updateError) throw updateError;
-
-      await service
-        .from('apollo_enrichment_requests')
-        .update({
-          status: 'completed',
-          raw_response: item.raw,
-          completed_at: new Date().toISOString(),
-        })
-        .eq('lead_id', lead.id);
-
-      if (lead.import_run_id) touchedRuns.add(lead.import_run_id);
-      updated += 1;
-    }
-
-    for (const runId of touchedRuns) {
-      const { data: run } = await service
-        .from('lead_import_runs')
-        .select('*')
-        .eq('id', runId)
-        .maybeSingle();
-
-      if (run) {
-        await updateImportRun(service, runId, {
-          raw_meta: {
-            ...(run.raw_meta || {}),
-            enrichment_status: 'webhook_received',
-            webhook_updated_count: ((run.raw_meta || {}).webhook_updated_count || 0) + updated,
-            last_webhook_at: new Date().toISOString(),
-          },
-        });
-      }
-    }
-
-    return res.json({ updated, skipped });
+    const result = await applyApolloUpdates(service, updates);
+    return res.json(result);
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to process Apollo webhook' });
   }
@@ -180,16 +327,199 @@ router.get('/filters', async (req, res) => {
   }
 });
 
+router.post('/sync-pending', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase
+      .from('apollo_enrichment_requests')
+      .select('apollo_request_id')
+      .eq('workspace_id', workspace.id)
+      .eq('status', 'pending')
+      .not('apollo_request_id', 'is', null)
+      .limit(50);
+
+    if (error) throw error;
+
+    const requestIds = [...new Set((data || []).map(row => row.apollo_request_id).filter(Boolean))];
+    debug('sync_pending_start', {
+      workspaceId: workspace.id,
+      requestCount: requestIds.length,
+      requestIds: requestIds.map(id => id.slice(-8)),
+    });
+    const sync = await pollAndApplyApolloRequests(req.supabase, requestIds);
+    debug('sync_pending_complete', sync);
+    return res.json({ sync, requestIds });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to sync Apollo enrichment' });
+  }
+});
+
+function normalizedCandidateKeys(lead = {}) {
+  return {
+    externalId: String(lead.external_id || '').trim(),
+    email: String(lead.email || '').trim().toLowerCase(),
+    phone: String(lead.phone || '').replace(/\D/g, ''),
+    linkedin: String(lead.linkedin_url || '').trim().toLowerCase(),
+    domain: String(lead.company_domain || lead.company_data?.domain || '').trim().toLowerCase(),
+    nameCompany: `${String(lead.full_name || '').trim().toLowerCase()}|${String(lead.company_name || '').trim().toLowerCase()}`,
+  };
+}
+
+function isSuppressed(lead, suppressions) {
+  const keys = normalizedCandidateKeys(lead);
+  return suppressions.some(row => {
+    const suppressed = normalizedCandidateKeys(row);
+    return Boolean(
+      (keys.externalId && keys.externalId === suppressed.externalId)
+      || (keys.email && keys.email === suppressed.email)
+      || (keys.phone && keys.phone === suppressed.phone)
+      || (keys.linkedin && keys.linkedin === suppressed.linkedin)
+      || (keys.domain && keys.domain === suppressed.domain)
+      || (keys.nameCompany !== '|' && keys.nameCompany === suppressed.nameCompany)
+    );
+  });
+}
+
+async function runApolloImport({ supabase, user, workspace, agentConfig, filters, run }) {
+  const target = filters.limit;
+  const candidateCap = Math.min(target * 3, 300);
+  const pageCap = 10;
+  const candidatePeople = [];
+  const leadByPersonId = new Map();
+  let searched = 0;
+  let skipped = 0;
+  let page = 1;
+
+  try {
+    await updateImportRun(supabase, run.id, {
+      status: 'searching',
+      raw_meta: { ...(run.raw_meta || {}), current_page: page, candidate_cap: candidateCap, page_cap: pageCap },
+    });
+
+    const { data: suppressions, error: suppressionError } = await supabase
+      .from('lead_suppressions')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .limit(10000);
+    if (suppressionError) throw suppressionError;
+
+    while (page <= pageCap && candidatePeople.length < candidateCap) {
+      const search = await searchPeople(filters, page, 100);
+      searched += search.people.length;
+      if (!search.people.length) break;
+
+      for (const person of search.people) {
+        if (candidatePeople.length >= candidateCap) break;
+        const leadInput = normalizeApolloLead(person, { searchFilters: filters, searchPage: page });
+        const normalized = normalizeLead({ ...leadInput, source: 'apollo' });
+        const existing = await findExistingLead(supabase, workspace.id, normalized);
+        if (existing || isSuppressed(normalized, suppressions || [])) {
+          skipped += 1;
+          continue;
+        }
+
+        leadInput.lifecycle_status = 'enriching';
+        leadInput.enrichment_status = 'pending';
+        leadInput.enrichment_attempts = 1;
+        leadInput.agent_config = agentConfig || {};
+        const result = await upsertLeadWithContext(supabase, user, workspace, leadInput, run.id, 'apollo');
+        if (result.skipped) {
+          skipped += 1;
+          continue;
+        }
+        const personId = apolloPersonId(person);
+        if (personId) leadByPersonId.set(personId, result.lead.id);
+        candidatePeople.push(person);
+      }
+
+      await updateImportRun(supabase, run.id, {
+        status: 'searching',
+        total_rows: candidatePeople.length,
+        created_count: candidatePeople.length,
+        skipped_count: skipped,
+        raw_meta: {
+          ...(run.raw_meta || {}),
+          current_page: page,
+          searched_count: searched,
+          candidate_count: candidatePeople.length,
+          target_ready_count: target,
+          candidate_cap: candidateCap,
+          page_cap: pageCap,
+        },
+      });
+      page += 1;
+    }
+
+    await updateImportRun(supabase, run.id, { status: 'enriching' });
+    const requestIds = [];
+    for (let offset = 0; offset < candidatePeople.length; offset += 10) {
+      const batchPeople = candidatePeople.slice(offset, offset + 10);
+      const batches = await requestBulkEnrichment(batchPeople, run.id);
+      await recordEnrichmentRequests(supabase, workspace.id, run.id, batches, leadByPersonId);
+      const batchRequestIds = batches.map(batch => batch.request_id).filter(Boolean);
+      requestIds.push(...batchRequestIds);
+      await pollAndApplyApolloRequests(supabase, batchRequestIds);
+
+      const [{ count: readyCount }, { count: pendingCount }] = await Promise.all([
+        supabase.from('leads').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('lifecycle_status', 'ready'),
+        supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('status', 'pending'),
+      ]);
+      if ((readyCount || 0) >= target || (pendingCount || 0) > 0) break;
+    }
+
+    const [{ count: readyCount }, { count: pendingCount }] = await Promise.all([
+      supabase.from('leads').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('lifecycle_status', 'ready'),
+      supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('status', 'pending'),
+    ]);
+    const ready = readyCount || 0;
+    const pending = pendingCount || 0;
+    const finalStatus = pending ? 'pending_enrichment' : (ready >= target ? 'completed' : 'partial');
+
+    await updateImportRun(supabase, run.id, {
+      status: finalStatus,
+      total_rows: candidatePeople.length,
+      created_count: candidatePeople.length,
+      skipped_count: skipped,
+      completed_at: pending ? null : new Date().toISOString(),
+      raw_meta: {
+        ...(run.raw_meta || {}),
+        filters,
+        requested_limit: target,
+        ready_count: ready,
+        pending_count: pending,
+        searched_count: searched,
+        searched_pages: page - 1,
+        candidate_count: candidatePeople.length,
+        candidate_cap: candidateCap,
+        page_cap: pageCap,
+        apollo_request_ids: requestIds,
+        stop_reason: ready >= target ? 'target_reached' : (candidatePeople.length >= candidateCap ? 'candidate_cap' : 'search_exhausted'),
+      },
+    });
+  } catch (error) {
+    await updateImportRun(supabase, run.id, {
+      status: 'failed',
+      error_message: error.message || 'Apollo import failed',
+      completed_at: new Date().toISOString(),
+      raw_meta: { ...(run.raw_meta || {}), apollo_error: error.payload || null },
+    }).catch(() => undefined);
+    debug('background_import_failed', { importRunId: run.id, message: error.message });
+  }
+}
+
 router.post('/import', async (req, res) => {
-  let run = null;
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const agentConfig = await getAgentConfig(req.supabase, workspace.id);
     const filters = normalizeFilters(req.body.filters || req.body, agentConfig || {});
-
-    if (!getWebhookUrl()) {
-      return res.status(400).json({ error: 'APOLLO_WEBHOOK_URL or APP_PUBLIC_URL is required for Apollo phone enrichment' });
-    }
+    debug('import_start', {
+      workspaceId: workspace.id,
+      titles: filters.titles,
+      region: filters.region,
+      industry: filters.industry,
+      companySize: filters.companySize,
+      limit: filters.limit,
+    });
 
     const { data: pendingRun, error: runError } = await req.supabase
       .from('lead_import_runs')
@@ -208,64 +538,72 @@ router.post('/import', async (req, res) => {
       .single();
 
     if (runError) throw runError;
-    run = pendingRun;
+    const queue = getLeadImportQueue();
+    await queue.add('apollo', {
+      runId: pendingRun.id,
+      workspaceId: workspace.id,
+      userId: req.user.id,
+      userEmail: req.user.email || null,
+      filters,
+    }, { jobId: `apollo:${pendingRun.id}` });
 
-    const search = await searchPeople(filters);
-    let created = 0;
-    let updated = 0;
-    let skipped = 0;
-    const leadByPersonId = new Map();
-
-    for (const person of search.people) {
-      const leadInput = normalizeApolloLead(person, { searchFilters: filters });
-      const result = await upsertLeadWithContext(req.supabase, req.user, workspace, leadInput, run.id, 'apollo');
-      if (result.skipped) {
-        skipped += 1;
-      } else {
-        const personId = apolloPersonId(person) || normalizeLead(leadInput).external_id;
-        if (personId) leadByPersonId.set(personId, result.lead.id);
-        if (result.updated) updated += 1;
-        else created += 1;
-      }
-    }
-
-    const batches = search.people.length ? await requestBulkEnrichment(search.people, run.id) : [];
-    await recordEnrichmentRequests(req.supabase, workspace.id, run.id, batches, leadByPersonId);
-
-    const completedRun = await updateImportRun(req.supabase, run.id, {
-      status: 'completed',
-      total_rows: search.people.length,
-      created_count: created,
-      updated_count: updated,
-      skipped_count: skipped,
-      completed_at: new Date().toISOString(),
-      raw_meta: {
-        ...(run.raw_meta || {}),
-        filters,
-        requested_limit: filters.limit,
-        search_count: search.people.length,
-        apollo_request_ids: batches.map(batch => batch.request_id).filter(Boolean),
-        enrichment_status: batches.length ? 'pending_webhook' : 'no_candidates',
-      },
-    });
-
-    return res.json({ importRun: completedRun });
+    return res.status(202).json({ importRun: pendingRun });
   } catch (error) {
-    if (run?.id) {
-      await updateImportRun(req.supabase, run.id, {
-        status: 'failed',
-        error_message: error.message || 'Apollo import failed',
-        completed_at: new Date().toISOString(),
-        raw_meta: {
-          ...(run.raw_meta || {}),
-          apollo_error: error.payload || null,
-        },
-      }).catch(() => undefined);
-    }
-
+    debug('import_failed', {
+      importRunId: null,
+      statusCode: error.statusCode || null,
+      message: error.message,
+      payload: error.payload || null,
+    });
     const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
     return res.status(status).json({ error: error.message || 'Failed to import Apollo leads' });
   }
 });
 
+router.post('/retry/:leadId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data: lead, error } = await req.supabase.from('leads').select('*')
+      .eq('workspace_id', workspace.id).eq('id', req.params.leadId).maybeSingle();
+    if (error) throw error;
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (lead.lifecycle_status !== 'rejected_no_email') return res.status(400).json({ error: 'Only no-email leads can be retried' });
+    const cooldownEnds = new Date(new Date(lead.last_enriched_at || 0).getTime() + 30 * 24 * 60 * 60 * 1000);
+    if (cooldownEnds > new Date()) {
+      return res.status(409).json({ error: `Enrichment can be retried after ${cooldownEnds.toISOString()}` });
+    }
+    const person = lead.raw_data?.apollo?.searchPerson;
+    if (!person || !lead.import_run_id) return res.status(400).json({ error: 'Apollo source data is unavailable for retry' });
+    await req.supabase.from('leads').update({
+      lifecycle_status: 'enriching',
+      enrichment_status: 'pending',
+      enrichment_attempts: Number(lead.enrichment_attempts || 0) + 1,
+      rejection_reason: null,
+    }).eq('id', lead.id);
+    const batches = await requestBulkEnrichment([person], lead.import_run_id);
+    await recordEnrichmentRequests(req.supabase, workspace.id, lead.import_run_id, batches, new Map([[lead.external_id, lead.id]]));
+    return res.status(202).json({ lead_id: lead.id, request_ids: batches.map(batch => batch.request_id).filter(Boolean) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to retry Apollo enrichment' });
+  }
+});
+
+router.get('/imports/:runId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase
+      .from('lead_import_runs')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('id', req.params.runId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Import run not found' });
+    return res.json({ importRun: data });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load import progress' });
+  }
+});
+
 module.exports = router;
+module.exports.runApolloImport = runApolloImport;

@@ -1,5 +1,6 @@
 const express = require('express');
 const requireAuth = require('../middleware/auth');
+const { suggestTargetTerms } = require('../lib/gemini');
 
 const router = express.Router();
 
@@ -11,57 +12,38 @@ function getAnswer(answers, key, fallback = '') {
   return value;
 }
 
+function targetTitles(answers) {
+  const selected = Array.isArray(answers?.titles) ? answers.titles : [];
+  const custom = String(answers?.titlesCustom || '').split(',').map(value => value.trim()).filter(Boolean);
+  return [...new Set([...selected, ...custom])];
+}
+
+function answerWithCustom(answers, key, fallback = '') {
+  const value = getAnswer(answers, key, fallback);
+  return value === 'Other' ? getAnswer(answers, `${key}Custom`, fallback) : value;
+}
+
 function generateSystemPrompt(answers) {
-  const titles = Array.isArray(answers.titles) && answers.titles.length
-    ? answers.titles.join(', ')
+  const normalizedTitles = targetTitles(answers);
+  const titles = normalizedTitles.length
+    ? normalizedTitles.join(', ')
     : 'CEO, Founder, Director';
 
-  return `# CircleOn- SYSTEM PROMPT
-# Market: Singapore
+  return `# Barsha Email Sales Agent
 
-## IDENTITY
-You are ${getAnswer(answers, 'agentName', 'Aria')}, calling on behalf of ${getAnswer(answers, 'company', '[Company]')} based in ${getAnswer(answers, 'city', 'Singapore')}.
-Industry: ${getAnswer(answers, 'industry', '[Industry]')}
+Company: ${getAnswer(answers, 'company', '[Company]')}
+Product or service: ${getAnswer(answers, 'product', '-')}
+Typical buyers: ${titles}
+Target region: ${answerWithCustom(answers, 'region', 'Singapore')}
+Target company size: ${answerWithCustom(answers, 'companySize', '-')}
+Business model: ${getAnswer(answers, 'bizType', 'B2B')}
 
-## PDPA COMPLIANCE - READ FIRST
-- You are operating under Singapore's Personal Data Protection Act (PDPA).
-- Disclose you are an AI agent if the prospect directly asks.
-- Do not call numbers on the DND Registry.
-- Calling hours: Monday-Friday, 9am-6pm SGT only.
-- On opt-out: log as DNC and end call immediately.
-- Inform prospect this call may be recorded for quality purposes.
+Customer problem: ${answerWithCustom(answers, 'customerProblem', '-')}
+Desired result: ${answerWithCustom(answers, 'vp', '-')}
+Common concern: ${answerWithCustom(answers, 'objections', '-')}
+Likely timing signal: ${answerWithCustom(answers, 'timingSignal', '-')}
 
-## COMPANY CONTEXT
-${getAnswer(answers, 'desc', '[Not provided]')}
-
-## YOUR OFFER
-Product/Service: ${getAnswer(answers, 'product', '-')}
-Pricing: ${getAnswer(answers, 'pricing', '-')}
-Value Prop: ${getAnswer(answers, 'vp', '-')}
-Booking Link: ${getAnswer(answers, 'calLink', '[Not set]')}
-
-## TARGET PROSPECT
-Business Model: ${getAnswer(answers, 'bizType', 'B2B')}
-Decision Maker Titles: ${titles}
-Company Size: ${getAnswer(answers, 'companySize', '-')}
-Target Region: ${getAnswer(answers, 'region', 'Singapore')}
-Min MRR: ${answers.mrr ? `S$${answers.mrr}k` : 'No filter'}
-
-## CALL FLOW
-[0:00] Open: "Hi, this is ${getAnswer(answers, 'agentName', 'Aria')} from ${getAnswer(answers, 'company', '[Company]')} - is now a good 2 minutes?"
-[0:20] Hook: one-sentence value statement for their industry.
-[0:45] Discovery: 1-2 open questions. Listen actively.
-[2:00] Pitch: share the core offer if they are engaged.
-[3:00] Objection Handling.
-[4:00] Close: offer the Calendly link for a 20-minute discovery call.
-
-## OBJECTION HANDLING
-${getAnswer(answers, 'objections', '1. Too busy: offer a specific callback time\n2. Have a solution: ask what they would improve about it\n3. No budget: ask what would need to change for them to consider it')}
-
-## TONE & CONSTRAINTS
-Style: ${getAnswer(answers, 'tone', 'Professional & Warm')}
-Max Clients: ${getAnswer(answers, 'capacity', '20')}/month - prioritise highest-intent prospects.
-Never quote exact prices, make guarantees, or sign agreements.`;
+Write concise, truthful, personalized B2B emails. Use only supplied lead and company facts. Respect opt-outs immediately. Never invent praise, customer results, or urgency. Tone: ${answerWithCustom(answers, 'tone', 'Professional')}. Booking link: ${answerWithCustom(answers, 'calLink', '[Not set]')}.`;
 }
 
 async function getOrCreateWorkspace(supabase, user) {
@@ -139,6 +121,19 @@ router.post('/plan', async (req, res) => {
   }
 });
 
+router.post('/target-suggestions', async (req, res) => {
+  try {
+    const suggestions = await suggestTargetTerms({
+      product: String(req.body.product || ''),
+      buyer: String(req.body.buyer || ''),
+      industry: String(req.body.industry || ''),
+    });
+    return res.json({ suggestions });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to suggest buyer roles' });
+  }
+});
+
 router.post('/onboarding-draft', async (req, res) => {
   try {
     const answers = req.body.answers || {};
@@ -173,9 +168,9 @@ router.post('/onboarding-draft', async (req, res) => {
         industry: getAnswer(answers, 'industry'),
         city: getAnswer(answers, 'city'),
         business_model: getAnswer(answers, 'bizType'),
-        target_titles: Array.isArray(answers.titles) ? answers.titles : [],
-        target_regions: getAnswer(answers, 'region'),
-        company_size: getAnswer(answers, 'companySize'),
+        target_titles: targetTitles(answers),
+        target_regions: answerWithCustom(answers, 'region'),
+        company_size: answerWithCustom(answers, 'companySize'),
         min_mrr_k_sgd: Number(getAnswer(answers, 'mrr', 0)),
         product: getAnswer(answers, 'product'),
         pricing_model: getAnswer(answers, 'pricing'),
@@ -213,7 +208,7 @@ router.post('/onboarding', async (req, res) => {
       .from('workspaces')
       .update({
         name: companyName || workspace.name,
-        onboarding_step: 17,
+        onboarding_step: 5,
         onboarding_completed: true,
       })
       .eq('id', workspace.id)
@@ -229,9 +224,9 @@ router.post('/onboarding', async (req, res) => {
       industry: getAnswer(answers, 'industry'),
       city: getAnswer(answers, 'city'),
       business_model: getAnswer(answers, 'bizType', 'B2B'),
-      target_titles: Array.isArray(answers.titles) ? answers.titles : [],
-      target_regions: getAnswer(answers, 'region'),
-      company_size: getAnswer(answers, 'companySize'),
+      target_titles: targetTitles(answers),
+      target_regions: answerWithCustom(answers, 'region'),
+      company_size: answerWithCustom(answers, 'companySize'),
       min_mrr_k_sgd: Number(getAnswer(answers, 'mrr', 0)),
       product: getAnswer(answers, 'product'),
       pricing_model: getAnswer(answers, 'pricing'),

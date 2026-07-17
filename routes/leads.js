@@ -1,6 +1,10 @@
 const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { normalizePhone } = require('../lib/calling');
+const { createServiceClient } = require('../lib/supabase');
+const { mapCsvColumns } = require('../lib/gemini');
+const { applyMapping, parseCsv } = require('../lib/csvLeads');
+const { getLeadImportQueue } = require('../lib/redis');
 
 const router = express.Router();
 
@@ -11,15 +15,82 @@ function clean(value) {
   return String(value).trim();
 }
 
+function normalizeEmail(value) {
+  return clean(value).toLowerCase();
+}
+
+function normalizeDomain(value) {
+  return clean(value)
+    .replace(/^https?:\/\//i, '')
+    .replace(/^www\./i, '')
+    .split('/')[0]
+    .toLowerCase();
+}
+
+function usableEmail(value) {
+  const email = normalizeEmail(value);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return false;
+  const local = email.split('@')[0];
+  return !['info', 'support', 'hello', 'contact', 'admin', 'sales'].includes(local);
+}
+
+function calculateFitScore(lead, agentConfig = {}) {
+  const reasons = [];
+  let score = 0;
+  const title = clean(lead.title).toLowerCase();
+  const companyIndustry = clean(lead.company_industry || lead.company_data?.industry).toLowerCase();
+  const targetTitles = Array.isArray(agentConfig.target_titles) ? agentConfig.target_titles : [];
+
+  if (targetTitles.some(target => title.includes(clean(target).toLowerCase()) || clean(target).toLowerCase().includes(title))) {
+    score += 25;
+    reasons.push({ points: 25, reason: 'Buyer role matches' });
+  }
+  if (agentConfig.industry && companyIndustry.includes(clean(agentConfig.industry).toLowerCase())) {
+    score += 25;
+    reasons.push({ points: 25, reason: 'Industry and use case match' });
+  }
+  const companyData = lead.company_data || {};
+  if (companyData.latest_funding_round_date || Number(companyData.total_funding || 0) > 0 || (companyData.raw?.job_postings || []).length) {
+    score += 20;
+    reasons.push({ points: 20, reason: 'Current growth or buying signal' });
+  }
+  if (agentConfig.company_size && (lead.company_size || companyData.estimated_num_employees)) {
+    score += 15;
+    reasons.push({ points: 15, reason: 'Company size data available for qualification' });
+  }
+  if (title) {
+    score += 10;
+    reasons.push({ points: 10, reason: 'Reachable named decision-maker' });
+  }
+  if (lead.company_name && (lead.company_domain || companyData.domain || companyData.short_description)) {
+    score += 5;
+    reasons.push({ points: 5, reason: 'Strong personalization data' });
+  }
+
+  return { score: Math.min(score, 100), reasons };
+}
+
 function normalizeLead(input = {}) {
+  const email = normalizeEmail(input.email);
+  const source = clean(input.source);
+  const userProvidedEmail = Boolean(email && source !== 'apollo');
   return {
     external_id: clean(input.external_id),
-    full_name: clean(input.full_name || input.name),
+    first_name: clean(input.first_name),
+    last_name: clean(input.last_name),
+    full_name: clean(input.full_name || input.name || `${clean(input.first_name)} ${clean(input.last_name)}`) || (email ? email.split('@')[0] : ''),
     company_name: clean(input.company_name || input.company),
     title: clean(input.title),
     phone: clean(input.phone),
     phone_e164: normalizePhone(input.phone_e164 || input.phone),
-    email: clean(input.email).toLowerCase(),
+    email,
+    email_status: clean(input.email_status) || (userProvidedEmail ? 'user_provided' : (email ? 'unverified' : 'unknown')),
+    email_source: clean(input.email_source) || (email ? (source || 'manual') : null),
+    email_updated_at: email ? (clean(input.email_updated_at) || new Date().toISOString()) : null,
+    linkedin_url: clean(input.linkedin_url),
+    company_domain: normalizeDomain(input.company_domain || input.website || input.company_website),
+    company_industry: clean(input.company_industry || input.industry),
+    company_size: clean(input.company_size),
     location: clean(input.location),
     status: clean(input.status) || 'new',
     priority: clean(input.priority) || 'normal',
@@ -29,7 +100,16 @@ function normalizeLead(input = {}) {
     callable_block_reason: clean(input.callable_block_reason),
     last_contacted_at: clean(input.last_contacted_at) || null,
     notes_summary: clean(input.notes_summary || input.note || input.history),
+    company_data: input.company_data || {},
     raw_data: input.raw_data || input,
+    lifecycle_status: clean(input.lifecycle_status) || (usableEmail(email) ? 'ready' : 'candidate'),
+    enrichment_status: clean(input.enrichment_status) || 'not_started',
+    enrichment_attempts: Number(input.enrichment_attempts || 0),
+    last_enriched_at: clean(input.last_enriched_at) || null,
+    rejection_reason: clean(input.rejection_reason) || null,
+    suppression_reason: clean(input.suppression_reason) || null,
+    fit_score: Number(input.fit_score || 0),
+    fit_reasons: Array.isArray(input.fit_reasons) ? input.fit_reasons : [],
   };
 }
 
@@ -106,19 +186,35 @@ async function findExistingLead(supabase, workspaceId, lead) {
     if (data) return data;
   }
 
+  if (lead.linkedin_url) {
+    const { data, error } = await supabase
+      .from('leads')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('linkedin_url', lead.linkedin_url)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+  }
+
   return null;
 }
 
 async function upsertLeadWithContext(supabase, user, workspace, input, importRunId = null, source = 'manual') {
-  const lead = normalizeLead(input);
+  const lead = normalizeLead({ ...input, source });
 
-  if (!lead.full_name || (source !== 'apollo' && !lead.phone && !lead.email)) {
-    return { skipped: true, reason: source === 'apollo' ? 'Apollo lead requires a name' : 'Lead requires name and phone or email' };
+  const hasIdentity = Boolean(lead.full_name || lead.email || lead.linkedin_url);
+  const hasCsvLocator = Boolean(lead.email || lead.linkedin_url || (lead.full_name && lead.company_name));
+  if (!hasIdentity || (source === 'csv' && !hasCsvLocator) || (source === 'manual' && !lead.phone && !lead.email)) {
+    return { skipped: true, reason: source === 'csv' ? 'CSV lead requires name and company, email, or LinkedIn URL' : 'Lead requires identifying contact data' };
   }
 
   const existing = await findExistingLead(supabase, workspace.id, lead);
+  const scored = calculateFitScore(lead, input.agent_config || {});
   const payload = {
     ...lead,
+    fit_score: lead.fit_score || scored.score,
+    fit_reasons: lead.fit_reasons.length ? lead.fit_reasons : scored.reasons,
     workspace_id: workspace.id,
     import_run_id: importRunId,
     source,
@@ -126,6 +222,13 @@ async function upsertLeadWithContext(supabase, user, workspace, input, importRun
 
   let savedLead;
   if (existing) {
+    if (existing.email && existing.email_source !== 'apollo') {
+      payload.email = existing.email;
+      payload.email_status = existing.email_status;
+      payload.email_source = existing.email_source;
+      payload.email_updated_at = existing.email_updated_at;
+      payload.lifecycle_status = existing.lifecycle_status;
+    }
     const { data, error } = await supabase
       .from('leads')
       .update(payload)
@@ -224,53 +327,172 @@ router.post('/', async (req, res) => {
 });
 
 router.post('/import-csv', async (req, res) => {
+  return res.status(410).json({
+    error: 'Direct CSV import is retired. Preview the CSV mapping and confirm it through /csv/import.',
+  });
+});
+
+router.post('/csv/preview', async (req, res) => {
   try {
-    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
-    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const parsed = parseCsv(req.body.csv_text || '');
+    if (!parsed.headers.length) return res.status(400).json({ error: 'CSV file has no headers' });
+    if (parsed.rows.length > 10000) return res.status(400).json({ error: 'CSV exceeds the 10,000-row limit' });
+    const mappings = await mapCsvColumns({ headers: parsed.headers, sampleRows: parsed.rows.slice(0, 5) });
+    const normalizedPreview = parsed.rows.slice(0, 5).map(row => applyMapping(row, mappings));
+    return res.json({
+      headers: parsed.headers,
+      row_count: parsed.rows.length,
+      mappings,
+      preview: normalizedPreview,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to map CSV columns' });
+  }
+});
 
-    const { data: run, error: runError } = await req.supabase
-      .from('lead_import_runs')
-      .insert({
-        workspace_id: workspace.id,
-        source: 'csv',
-        status: 'pending',
-        total_rows: rows.length,
-        raw_meta: { columns: Object.keys(rows[0] || {}) },
-      })
-      .select('*')
-      .single();
+async function processCsvImport({ supabase, user, workspace, run, rows, mappings, mode }) {
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+  const seen = new Set();
+  const rejected = [];
+  try {
+    for (let index = 0; index < rows.length; index += 1) {
+      const input = applyMapping(rows[index], mappings);
+      const normalized = normalizeLead({ ...input, source: 'csv' });
+      const key = normalized.email || normalized.linkedin_url || normalized.external_id
+        || `${normalized.full_name.toLowerCase()}|${normalized.company_name.toLowerCase()}`;
+      if (!key || seen.has(key)) {
+        skipped += 1;
+        rejected.push({ row: index + 2, reason: 'Duplicate or missing identity' });
+        continue;
+      }
+      seen.add(key);
 
-    if (runError) throw runError;
+      if (mode === 'suppress') {
+        const suppression = {
+          workspace_id: workspace.id,
+          import_run_id: run.id,
+          external_id: normalized.external_id || null,
+          email: normalized.email || null,
+          phone: normalized.phone || null,
+          linkedin_url: normalized.linkedin_url || null,
+          company_domain: normalized.company_domain || null,
+          full_name: normalized.full_name || null,
+          company_name: normalized.company_name || null,
+          reason: 'user_csv',
+          raw_data: input.raw_data || {},
+        };
+        const hasLocator = Object.entries(suppression).some(([field, value]) => ['external_id', 'email', 'phone', 'linkedin_url', 'company_domain'].includes(field) && value)
+          || (suppression.full_name && suppression.company_name);
+        if (!hasLocator) {
+          skipped += 1;
+          rejected.push({ row: index + 2, reason: 'Suppression row has no matchable identity' });
+          continue;
+        }
+        const { error } = await supabase.from('lead_suppressions').insert(suppression);
+        if (error) throw error;
+        if (suppression.company_domain) {
+          await supabase.from('leads').update({ lifecycle_status: 'suppressed', suppression_reason: 'Matched user CSV exclusion' })
+            .eq('workspace_id', workspace.id).eq('company_domain', suppression.company_domain);
+        } else {
+          const existing = await findExistingLead(supabase, workspace.id, normalized);
+          if (existing) {
+            await supabase.from('leads').update({ lifecycle_status: 'suppressed', suppression_reason: 'Matched user CSV exclusion' }).eq('id', existing.id);
+          }
+        }
+        created += 1;
+        continue;
+      }
 
-    let created = 0;
-    let updated = 0;
-    let skipped = 0;
-
-    for (const row of rows) {
-      const result = await upsertLeadWithContext(req.supabase, req.user, workspace, row, run.id, 'csv');
-      if (result.skipped) skipped += 1;
-      else if (result.updated) updated += 1;
+      input.lifecycle_status = usableEmail(normalized.email) ? 'ready' : 'candidate';
+      input.email_status = normalized.email ? 'user_provided' : 'unknown';
+      input.email_source = normalized.email ? 'csv' : null;
+      const result = await upsertLeadWithContext(supabase, user, workspace, input, run.id, 'csv');
+      if (result.skipped) {
+        skipped += 1;
+        rejected.push({ row: index + 2, reason: result.reason });
+      } else if (result.updated) updated += 1;
       else created += 1;
     }
 
-    const { data: completedRun, error: updateError } = await req.supabase
-      .from('lead_import_runs')
-      .update({
-        status: 'completed',
-        created_count: created,
-        updated_count: updated,
-        skipped_count: skipped,
-        completed_at: new Date().toISOString(),
-      })
-      .eq('id', run.id)
-      .select('*')
-      .single();
-
-    if (updateError) throw updateError;
-
-    return res.json({ importRun: completedRun });
+    await supabase.from('lead_import_runs').update({
+      status: 'completed',
+      created_count: created,
+      updated_count: updated,
+      skipped_count: skipped,
+      completed_at: new Date().toISOString(),
+      raw_meta: { ...(run.raw_meta || {}), mode, rejected },
+    }).eq('id', run.id);
   } catch (error) {
-    return res.status(500).json({ error: error.message || 'Failed to import CSV leads' });
+    await supabase.from('lead_import_runs').update({
+      status: 'failed',
+      error_message: error.message,
+      completed_at: new Date().toISOString(),
+      raw_meta: { ...(run.raw_meta || {}), mode, rejected },
+    }).eq('id', run.id);
+  }
+}
+
+router.post('/csv/import', async (req, res) => {
+  try {
+    const mode = req.body.mode === 'suppress' ? 'suppress' : 'import';
+    const mappings = Array.isArray(req.body.mappings) ? req.body.mappings : [];
+    const parsed = parseCsv(req.body.csv_text || '');
+    if (!parsed.rows.length || !mappings.length) return res.status(400).json({ error: 'Confirmed CSV mapping is required' });
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data: run, error } = await req.supabase.from('lead_import_runs').insert({
+      workspace_id: workspace.id,
+      source: 'csv',
+      status: 'pending',
+      total_rows: parsed.rows.length,
+      raw_meta: { mode, columns: parsed.headers, mappings },
+    }).select('*').single();
+    if (error) throw error;
+    const queue = getLeadImportQueue();
+    await queue.add('csv', {
+      runId: run.id,
+      workspaceId: workspace.id,
+      userId: req.user.id,
+      userEmail: req.user.email || null,
+      rows: parsed.rows,
+      mappings,
+      mode,
+    }, { jobId: `csv:${run.id}` });
+    return res.status(202).json({ importRun: run });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to start CSV import' });
+  }
+});
+
+router.get('/imports/:runId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase.from('lead_import_runs').select('*')
+      .eq('workspace_id', workspace.id).eq('id', req.params.runId).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Import run not found' });
+    return res.json({ importRun: data });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load CSV import progress' });
+  }
+});
+
+router.get('/imports/:runId/errors.csv', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase.from('lead_import_runs').select('id, raw_meta')
+      .eq('workspace_id', workspace.id).eq('id', req.params.runId).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Import run not found' });
+    const rejected = Array.isArray(data.raw_meta?.rejected) ? data.raw_meta.rejected : [];
+    const csvCell = value => `"${String(value ?? '').replace(/"/g, '""')}"`;
+    const body = ['row,reason', ...rejected.map(item => `${csvCell(item.row)},${csvCell(item.reason)}`)].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="barsha-import-${data.id}-errors.csv"`);
+    return res.send(body);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to download CSV import errors' });
   }
 });
 
@@ -326,3 +548,7 @@ module.exports = router;
 module.exports.normalizeLead = normalizeLead;
 module.exports.findExistingLead = findExistingLead;
 module.exports.upsertLeadWithContext = upsertLeadWithContext;
+module.exports.calculateFitScore = calculateFitScore;
+module.exports.normalizeDomain = normalizeDomain;
+module.exports.usableEmail = usableEmail;
+module.exports.processCsvImport = processCsvImport;

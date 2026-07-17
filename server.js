@@ -5,6 +5,9 @@ const authRoutes = require('./routes/auth');
 const workspaceRoutes = require('./routes/workspace');
 const leadRoutes = require('./routes/leads');
 const apolloRoutes = require('./routes/apollo');
+const campaignRoutes = require('./routes/campaigns');
+const emailRoutes = require('./routes/emails');
+const inboxRoutes = require('./routes/inbox');
 const callingRoutes = require('./routes/calling');
 const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
@@ -29,12 +32,15 @@ app.use((req, res, next) => {
   return res.status(403).json({ error: 'Invalid request origin' });
 });
 app.use('/api/retell/webhook', express.raw({ type: 'application/json', limit: '1mb' }), retellWebhookRoutes);
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 app.use('/api/auth', authRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/apollo', apolloRoutes);
+app.use('/api/campaigns', campaignRoutes);
+app.use('/api/emails', emailRoutes);
+app.use('/api/inbox', inboxRoutes);
 app.use('/api/calling', callingRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
