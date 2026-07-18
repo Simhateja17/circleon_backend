@@ -98,8 +98,8 @@ const campaignSchema = z.object({
   cadence_per_hour: z.number().int().min(1).max(100).default(25),
 });
 
-const generateSchema = z.object({
-  lead_ids: z.array(z.string().uuid()).default([]),
+const campaignLeadSchema = z.object({
+  lead_ids: z.array(z.string().uuid()).max(1000),
 });
 
 async function createDefaultSequence(req, campaignId) {
@@ -133,6 +133,36 @@ async function loadCampaign(req, workspaceId, campaignId) {
 
   if (error) throw error;
   return data;
+}
+
+async function loadCampaignLeadIds(req, workspaceId, campaignId) {
+  const { data, error } = await req.supabase
+    .from('campaign_leads')
+    .select('lead_id')
+    .eq('workspace_id', workspaceId)
+    .eq('campaign_id', campaignId);
+  if (error) throw error;
+  return (data || []).map(row => row.lead_id);
+}
+
+async function restoreUnassignedLeadLifecycle(req, workspaceId, leadIds) {
+  if (!leadIds.length) return;
+  const { data: remaining, error: remainingError } = await req.supabase
+    .from('campaign_leads')
+    .select('lead_id')
+    .eq('workspace_id', workspaceId)
+    .in('lead_id', leadIds);
+  if (remainingError) throw remainingError;
+  const assigned = new Set((remaining || []).map(row => row.lead_id));
+  const unassigned = leadIds.filter(id => !assigned.has(id));
+  if (!unassigned.length) return;
+  const { error } = await req.supabase
+    .from('leads')
+    .update({ lifecycle_status: 'ready' })
+    .eq('workspace_id', workspaceId)
+    .eq('lifecycle_status', 'selected_for_campaign')
+    .in('id', unassigned);
+  if (error) throw error;
 }
 
 router.use(requireAuth);
@@ -205,25 +235,96 @@ router.get('/:campaignId', async (req, res) => {
   }
 });
 
-router.post('/:campaignId/generate', async (req, res) => {
+router.get('/:campaignId/leads', async (req, res) => {
   try {
-    const parsed = generateSchema.safeParse(req.body || {});
-    if (!parsed.success) {
-      return res.status(400).json({
-        error: 'Invalid generate payload',
-        details: parsed.error.flatten(),
-      });
-    }
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    const leadIds = await loadCampaignLeadIds(req, workspace.id, campaign.id);
+    return res.json({ lead_ids: leadIds });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load campaign leads' });
+  }
+});
+
+router.put('/:campaignId/leads', async (req, res) => {
+  try {
+    const parsed = campaignLeadSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid campaign leads payload', details: parsed.error.flatten() });
 
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Pause the campaign before changing its selected leads' });
+    }
+
+    const requestedIds = [...new Set(parsed.data.lead_ids)];
+    let leads = [];
+    if (requestedIds.length) {
+      const { data, error } = await req.supabase
+        .from('leads')
+        .select('id, email, lifecycle_status, dnc_status')
+        .eq('workspace_id', workspace.id)
+        .in('id', requestedIds);
+      if (error) throw error;
+      leads = data || [];
+    }
+    const eligible = leads.filter(lead => lead.email && ['ready', 'selected_for_campaign'].includes(lead.lifecycle_status) && lead.dnc_status !== 'blocked');
+    if (eligible.length !== requestedIds.length) {
+      return res.status(400).json({ error: 'Each campaign lead must be ready, have an email, and not be suppressed' });
+    }
+
+    const existingIds = await loadCampaignLeadIds(req, workspace.id, campaign.id);
+    const requested = new Set(requestedIds);
+    const removedIds = existingIds.filter(id => !requested.has(id));
+    if (removedIds.length) {
+      const { error } = await req.supabase
+        .from('campaign_leads')
+        .delete()
+        .eq('workspace_id', workspace.id)
+        .eq('campaign_id', campaign.id)
+        .in('lead_id', removedIds);
+      if (error) throw error;
+    }
+    if (requestedIds.length) {
+      const { error } = await req.supabase.from('campaign_leads').upsert(
+        requestedIds.map(leadId => ({ campaign_id: campaign.id, lead_id: leadId, workspace_id: workspace.id, selected_by: req.user.id })),
+        { onConflict: 'campaign_id,lead_id' }
+      );
+      if (error) throw error;
+      const { error: lifecycleError } = await req.supabase
+        .from('leads')
+        .update({ lifecycle_status: 'selected_for_campaign' })
+        .eq('workspace_id', workspace.id)
+        .in('id', requestedIds);
+      if (lifecycleError) throw lifecycleError;
+    }
+    await restoreUnassignedLeadLifecycle(req, workspace.id, removedIds);
+    return res.json({ lead_ids: requestedIds });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update campaign leads' });
+  }
+});
+
+router.post('/:campaignId/generate', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Pause the campaign before generating additional emails' });
+    }
+    const selectedLeadIds = await loadCampaignLeadIds(req, workspace.id, campaign.id);
+    if (!selectedLeadIds.length) return res.status(400).json({ error: 'Select at least one lead for this campaign before generating' });
     const { data: leads, error: leadError } = await req.supabase
       .from('leads')
       .select('*')
       .eq('workspace_id', workspace.id)
-      .in('id', parsed.data.lead_ids);
+      .in('id', selectedLeadIds);
     if (leadError) throw leadError;
     const eligible = (leads || []).filter(lead => ['ready', 'selected_for_campaign'].includes(lead.lifecycle_status) && lead.dnc_status !== 'blocked' && lead.email);
-    if (eligible.length !== parsed.data.lead_ids.length) {
+    if (eligible.length !== selectedLeadIds.length) {
       return res.status(400).json({ error: 'Every selected lead must be ready, have an email, and not be suppressed' });
     }
 
@@ -244,23 +345,17 @@ router.post('/:campaignId/generate', async (req, res) => {
       if (enrichError) throw enrichError;
     }
 
-    if (eligible.length) {
-      const { error: selectionError } = await req.supabase.from('campaign_leads').upsert(
-        eligible.map(lead => ({ campaign_id: req.params.campaignId, lead_id: lead.id, workspace_id: workspace.id, selected_by: req.user.id })),
-        { onConflict: 'campaign_id,lead_id' }
-      );
-      if (selectionError) throw selectionError;
-      const { error: lifecycleError } = await req.supabase.from('leads').update({ lifecycle_status: 'selected_for_campaign' }).in('id', eligible.map(lead => lead.id));
-      if (lifecycleError) throw lifecycleError;
-    }
     const result = await preGenerateStep1({
       supabase: req.supabase,
       workspaceId: workspace.id,
-      campaignId: req.params.campaignId,
-      leadIds: parsed.data.lead_ids,
+      campaignId: campaign.id,
+      leadIds: selectedLeadIds,
     });
-
-    return res.json({ result });
+    const [savedCampaign, messages] = await Promise.all([
+      loadCampaign(req, workspace.id, campaign.id),
+      getPreviewMessages({ supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, limit: 100 }),
+    ]);
+    return res.json({ campaign: savedCampaign, messages, result });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to generate campaign emails' });
   }
@@ -273,7 +368,7 @@ router.get('/:campaignId/preview', async (req, res) => {
       supabase: req.supabase,
       workspaceId: workspace.id,
       campaignId: req.params.campaignId,
-      limit: 5,
+      limit: 100,
     });
 
     return res.json({ messages });
@@ -297,6 +392,46 @@ router.get('/:campaignId/messages', async (req, res) => {
     return res.json({ messages: data || [] });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load campaign messages' });
+  }
+});
+
+router.post('/:campaignId/messages/:messageId/send-now', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const [campaign, accountResult, messageResult] = await Promise.all([
+      loadCampaign(req, workspace.id, req.params.campaignId),
+      req.supabase.from('connected_accounts').select('id, status, smtp_verified_at, imap_verified_at').eq('workspace_id', workspace.id).eq('provider', 'smtp').maybeSingle(),
+      req.supabase.from('messages').select('id, lead_id, status, direction, sequence_step, leads(email, dnc_status, status)').eq('workspace_id', workspace.id).eq('campaign_id', req.params.campaignId).eq('id', req.params.messageId).maybeSingle(),
+    ]);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.status !== 'active') return res.status(400).json({ error: 'Launch the campaign before sending an email immediately' });
+    if (accountResult.error) throw accountResult.error;
+    const account = accountResult.data;
+    if (!account || account.status !== 'connected' || !account.smtp_verified_at || !account.imap_verified_at) {
+      return res.status(400).json({ error: 'Connect and verify both SMTP and IMAP before sending' });
+    }
+    if (messageResult.error) throw messageResult.error;
+    const message = messageResult.data;
+    if (!message || message.direction !== 'outbound' || message.sequence_step !== 1) return res.status(404).json({ error: 'Campaign email not found' });
+    if (!['draft', 'approved'].includes(message.status)) return res.status(400).json({ error: `This email cannot be sent now because it is ${message.status}` });
+    if (!message.leads?.email || message.leads?.dnc_status === 'blocked' || message.leads?.status === 'do_not_call') {
+      return res.status(400).json({ error: 'This lead cannot receive email' });
+    }
+    const now = new Date().toISOString();
+    const { error: approvalError } = await req.supabase.from('messages').update({ status: 'approved', approved_by: req.user.id, approved_at: now }).eq('id', message.id);
+    if (approvalError) throw approvalError;
+    const queue = getEmailSendQueue();
+    await queue.add('send-step', {
+      workspaceId: workspace.id,
+      campaignId: campaign.id,
+      messageId: message.id,
+      leadId: message.lead_id,
+      sequenceStep: 1,
+      scheduledAt: now,
+    }, { jobId: createQueueJobId('send-now', message.id) });
+    return res.json({ queued: true, message_id: message.id });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to queue the immediate email' });
   }
 });
 
