@@ -12,6 +12,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 5001,
+        LEAD_IMPORT_WORKER_ENABLED: 'false',
       },
       // Logs are written relative to cwd unless absolute paths are provided.
       error_file: '/var/log/barsha-backend/err.log',

@@ -2,7 +2,7 @@ const express = require('express');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { getPreviewMessages, preGenerateStep1 } = require('../lib/emailSequence');
-const { getEmailSendQueue } = require('../lib/redis');
+const { createQueueJobId, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const { enrichOrganizationForPerson } = require('../lib/apollo');
 
@@ -80,7 +80,7 @@ function buildSendJobs({ messages, campaign, workspaceId, now = new Date() }) {
         scheduledAt: scheduledAt.toISOString(),
       },
       opts: {
-        jobId: `send:${message.id}`,
+        jobId: createQueueJobId('send', message.id),
         delay: Math.max(0, scheduledAt.getTime() - now.getTime()),
       },
     };

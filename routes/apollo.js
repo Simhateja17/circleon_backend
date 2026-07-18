@@ -2,7 +2,7 @@ const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { createServiceClient } = require('../lib/supabase');
 const { getOrCreateWorkspace } = require('../lib/workspace');
-const { getLeadImportQueue } = require('../lib/redis');
+const { createQueueJobId, getLeadImportQueue } = require('../lib/redis');
 const { findExistingLead, normalizeLead, upsertLeadWithContext, usableEmail } = require('./leads');
 const {
   APOLLO_BLOCK_REASON,
@@ -22,6 +22,10 @@ const router = express.Router();
 function debug(event, details = {}) {
   if (process.env.APOLLO_DEBUG === 'false') return;
   console.log(`[apollo:${event}]`, JSON.stringify(details));
+}
+
+function estimateImportSeconds(target) {
+  return 20 + (Math.ceil(Math.max(1, Number(target || 1)) / 10) * 45);
 }
 
 function mergeRawData(existing = {}, patch = {}) {
@@ -250,6 +254,12 @@ async function applyApolloUpdates(supabase, updates) {
         completed_at: (pending || hasMore) ? null : new Date().toISOString(),
         raw_meta: {
           ...(run.raw_meta || {}),
+          stage: (pending || hasMore) ? 'waiting_for_enrichment' : 'completed',
+          stage_label: (pending || hasMore)
+            ? (hasMore ? 'Requesting the next email batch' : 'Waiting for Apollo email results')
+            : (ready >= target ? 'Ready leads reached' : 'Import finished with partial results'),
+          eta_seconds: (pending || hasMore) ? 60 : 0,
+          last_progress_at: new Date().toISOString(),
           enrichment_status: 'webhook_received',
           webhook_updated_count: ((run.raw_meta || {}).webhook_updated_count || 0) + updated,
           last_webhook_at: new Date().toISOString(),
@@ -389,11 +399,45 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
   let searched = 0;
   let skipped = 0;
   let page = 1;
+  const startedAt = new Date().toISOString();
+  let progressMeta = {
+    ...(run.raw_meta || {}),
+    stage: 'starting',
+    stage_label: 'Starting Apollo import',
+    started_at: startedAt,
+    estimated_total_seconds: estimateImportSeconds(target),
+    eta_seconds: estimateImportSeconds(target),
+    target_ready_count: target,
+    candidate_cap: candidateCap,
+    page_cap: pageCap,
+  };
+
+  async function reportProgress(status, metaPatch = {}, rowPatch = {}) {
+    progressMeta = { ...progressMeta, ...metaPatch, last_progress_at: new Date().toISOString() };
+    const updated = await updateImportRun(supabase, run.id, {
+      status,
+      raw_meta: progressMeta,
+      ...rowPatch,
+    });
+    debug('import_progress', {
+      runId: run.id,
+      stage: progressMeta.stage,
+      page: progressMeta.current_page || null,
+      searched: progressMeta.searched_count || 0,
+      candidates: progressMeta.candidate_count || 0,
+      requested: progressMeta.enrichment_requested_count || 0,
+      ready: progressMeta.ready_count || 0,
+      pending: progressMeta.pending_count || 0,
+      etaSeconds: progressMeta.eta_seconds ?? null,
+    });
+    return updated;
+  }
 
   try {
-    await updateImportRun(supabase, run.id, {
-      status: 'searching',
-      raw_meta: { ...(run.raw_meta || {}), current_page: page, candidate_cap: candidateCap, page_cap: pageCap },
+    await reportProgress('searching', {
+      stage: 'searching',
+      stage_label: 'Searching Apollo for matching people',
+      current_page: page,
     });
 
     const { data: suppressions, error: suppressionError } = await supabase
@@ -404,9 +448,13 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     if (suppressionError) throw suppressionError;
 
     while (page <= pageCap && candidatePeople.length < candidateCap) {
+      debug('search_page_started', { runId: run.id, page, candidateCount: candidatePeople.length, candidateCap });
       const search = await searchPeople(filters, page, 100);
       searched += search.people.length;
-      if (!search.people.length) break;
+      if (!search.people.length) {
+        debug('search_exhausted', { runId: run.id, page, searched });
+        break;
+      }
 
       for (const person of search.people) {
         if (candidatePeople.length >= candidateCap) break;
@@ -432,28 +480,45 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
         candidatePeople.push(person);
       }
 
-      await updateImportRun(supabase, run.id, {
-        status: 'searching',
+      const searchProgress = Math.min(1, page / pageCap);
+      await reportProgress('searching', {
+        stage: 'searching',
+        stage_label: `Searched Apollo page ${page}`,
+        current_page: page,
+        searched_pages: page,
+        searched_count: searched,
+        candidate_count: candidatePeople.length,
+        skipped_count: skipped,
+        eta_seconds: Math.max(30, Math.round(estimateImportSeconds(target) * (1 - searchProgress * 0.2))),
+      }, {
         total_rows: candidatePeople.length,
         created_count: candidatePeople.length,
         skipped_count: skipped,
-        raw_meta: {
-          ...(run.raw_meta || {}),
-          current_page: page,
-          searched_count: searched,
-          candidate_count: candidatePeople.length,
-          target_ready_count: target,
-          candidate_cap: candidateCap,
-          page_cap: pageCap,
-        },
       });
       page += 1;
     }
 
-    await updateImportRun(supabase, run.id, { status: 'enriching' });
+    const totalBatches = Math.ceil(candidatePeople.length / 10);
+    await reportProgress('enriching', {
+      stage: 'enriching',
+      stage_label: 'Enriching work emails in credit-safe batches',
+      searched_pages: page - 1,
+      total_enrichment_batches: totalBatches,
+      current_enrichment_batch: 0,
+      enrichment_requested_count: 0,
+      eta_seconds: Math.max(20, totalBatches * 45),
+    });
     const requestIds = [];
     for (let offset = 0; offset < candidatePeople.length; offset += 10) {
       const batchPeople = candidatePeople.slice(offset, offset + 10);
+      const batchNumber = Math.floor(offset / 10) + 1;
+      await reportProgress('enriching', {
+        stage: 'enriching',
+        stage_label: `Requesting email batch ${batchNumber} of ${totalBatches}`,
+        current_enrichment_batch: batchNumber,
+        enrichment_requested_count: offset,
+        eta_seconds: Math.max(15, (totalBatches - batchNumber + 1) * 45),
+      });
       const batches = await requestBulkEnrichment(batchPeople, run.id);
       await recordEnrichmentRequests(supabase, workspace.id, run.id, batches, leadByPersonId);
       const batchRequestIds = batches.map(batch => batch.request_id).filter(Boolean);
@@ -464,6 +529,15 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
         supabase.from('leads').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('lifecycle_status', 'ready'),
         supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('workspace_id', workspace.id).eq('import_run_id', run.id).eq('status', 'pending'),
       ]);
+      await reportProgress((pendingCount || 0) > 0 ? 'pending_enrichment' : 'enriching', {
+        stage: (pendingCount || 0) > 0 ? 'waiting_for_enrichment' : 'enriching',
+        stage_label: (pendingCount || 0) > 0 ? 'Waiting for Apollo email results' : `Completed email batch ${batchNumber}`,
+        current_enrichment_batch: batchNumber,
+        enrichment_requested_count: Math.min(candidatePeople.length, offset + batchPeople.length),
+        ready_count: readyCount || 0,
+        pending_count: pendingCount || 0,
+        eta_seconds: (pendingCount || 0) > 0 ? 60 : Math.max(10, (totalBatches - batchNumber) * 45),
+      });
       if ((readyCount || 0) >= target || (pendingCount || 0) > 0) break;
     }
 
@@ -475,39 +549,45 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     const pending = pendingCount || 0;
     const finalStatus = pending ? 'pending_enrichment' : (ready >= target ? 'completed' : 'partial');
 
-    await updateImportRun(supabase, run.id, {
-      status: finalStatus,
+    await reportProgress(finalStatus, {
+      stage: pending ? 'waiting_for_enrichment' : 'completed',
+      stage_label: pending ? 'Waiting for Apollo email results' : (ready >= target ? 'Ready leads reached' : 'Import finished with partial results'),
+      eta_seconds: pending ? 60 : 0,
+      filters,
+      requested_limit: target,
+      ready_count: ready,
+      pending_count: pending,
+      searched_count: searched,
+      searched_pages: page - 1,
+      candidate_count: candidatePeople.length,
+      apollo_request_ids: requestIds,
+      stop_reason: ready >= target ? 'target_reached' : (candidatePeople.length >= candidateCap ? 'candidate_cap' : 'search_exhausted'),
+    }, {
       total_rows: candidatePeople.length,
       created_count: candidatePeople.length,
       skipped_count: skipped,
       completed_at: pending ? null : new Date().toISOString(),
-      raw_meta: {
-        ...(run.raw_meta || {}),
-        filters,
-        requested_limit: target,
-        ready_count: ready,
-        pending_count: pending,
-        searched_count: searched,
-        searched_pages: page - 1,
-        candidate_count: candidatePeople.length,
-        candidate_cap: candidateCap,
-        page_cap: pageCap,
-        apollo_request_ids: requestIds,
-        stop_reason: ready >= target ? 'target_reached' : (candidatePeople.length >= candidateCap ? 'candidate_cap' : 'search_exhausted'),
-      },
     });
   } catch (error) {
     await updateImportRun(supabase, run.id, {
       status: 'failed',
       error_message: error.message || 'Apollo import failed',
       completed_at: new Date().toISOString(),
-      raw_meta: { ...(run.raw_meta || {}), apollo_error: error.payload || null },
+      raw_meta: {
+        ...progressMeta,
+        stage: 'failed',
+        stage_label: 'Apollo import failed',
+        eta_seconds: 0,
+        last_progress_at: new Date().toISOString(),
+        apollo_error: error.payload || null,
+      },
     }).catch(() => undefined);
     debug('background_import_failed', { importRunId: run.id, message: error.message });
   }
 }
 
 router.post('/import', async (req, res) => {
+  let pendingRun = null;
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const agentConfig = await getAgentConfig(req.supabase, workspace.id);
@@ -521,7 +601,7 @@ router.post('/import', async (req, res) => {
       limit: filters.limit,
     });
 
-    const { data: pendingRun, error: runError } = await req.supabase
+    const { data, error: runError } = await req.supabase
       .from('lead_import_runs')
       .insert({
         workspace_id: workspace.id,
@@ -532,12 +612,19 @@ router.post('/import', async (req, res) => {
           filters,
           requested_limit: filters.limit,
           enrichment_status: 'not_started',
+          stage: 'queued',
+          stage_label: 'Waiting for the lead-import worker',
+          estimated_total_seconds: estimateImportSeconds(filters.limit),
+          eta_seconds: estimateImportSeconds(filters.limit),
+          queued_at: new Date().toISOString(),
+          last_progress_at: new Date().toISOString(),
         },
       })
       .select('*')
       .single();
 
     if (runError) throw runError;
+    pendingRun = data;
     const queue = getLeadImportQueue();
     await queue.add('apollo', {
       runId: pendingRun.id,
@@ -545,12 +632,23 @@ router.post('/import', async (req, res) => {
       userId: req.user.id,
       userEmail: req.user.email || null,
       filters,
-    }, { jobId: `apollo:${pendingRun.id}` });
+    }, { jobId: createQueueJobId('apollo', pendingRun.id) });
 
     return res.status(202).json({ importRun: pendingRun });
   } catch (error) {
+    if (pendingRun?.id) {
+      try {
+        await req.supabase.from('lead_import_runs').update({
+          status: 'failed',
+          error_message: error.message || 'Failed to queue Apollo import',
+          completed_at: new Date().toISOString(),
+        }).eq('id', pendingRun.id);
+      } catch (_) {
+        // Preserve the original queue error returned to the caller.
+      }
+    }
     debug('import_failed', {
-      importRunId: null,
+      importRunId: pendingRun?.id || null,
       statusCode: error.statusCode || null,
       message: error.message,
       payload: error.payload || null,
@@ -585,6 +683,24 @@ router.post('/retry/:leadId', async (req, res) => {
     return res.status(202).json({ lead_id: lead.id, request_ids: batches.map(batch => batch.request_id).filter(Boolean) });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to retry Apollo enrichment' });
+  }
+});
+
+router.get('/imports/latest', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase
+      .from('lead_import_runs')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('source', 'apollo')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return res.json({ importRun: data || null });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load latest Apollo import' });
   }
 });
 

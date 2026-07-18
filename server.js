@@ -15,6 +15,7 @@ const outcomeRoutes = require('./routes/outcomes');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
+const { createWorker: createLeadImportWorker } = require('./workers/lead-import.worker');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -53,6 +54,18 @@ app.use(apiErrorHandler);
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
+  const runLeadWorkerInProcess = process.env.LEAD_IMPORT_WORKER_ENABLED === 'true'
+    || (process.env.LEAD_IMPORT_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
+  if (runLeadWorkerInProcess) {
+    try {
+      createLeadImportWorker();
+      console.log('[lead-import-worker] running in this process');
+    } catch (error) {
+      console.error('[lead-import-worker] failed to start', error.message);
+    }
+  } else {
+    console.log('[lead-import-worker] in-process worker disabled');
+  }
   startCallingQueue();
   resumeQueuedAgentLaunchJobs().catch(error => {
     console.error('[agent-launch-recovery] failed', error);

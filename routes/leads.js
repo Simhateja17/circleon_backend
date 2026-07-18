@@ -4,7 +4,7 @@ const { normalizePhone } = require('../lib/calling');
 const { createServiceClient } = require('../lib/supabase');
 const { mapCsvColumns } = require('../lib/gemini');
 const { applyMapping, parseCsv } = require('../lib/csvLeads');
-const { getLeadImportQueue } = require('../lib/redis');
+const { createQueueJobId, getLeadImportQueue } = require('../lib/redis');
 
 const router = express.Router();
 
@@ -326,6 +326,68 @@ router.post('/', async (req, res) => {
   }
 });
 
+router.patch('/:leadId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data: existing, error: existingError } = await req.supabase
+      .from('leads')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('id', req.params.leadId)
+      .maybeSingle();
+    if (existingError) throw existingError;
+    if (!existing) return res.status(404).json({ error: 'Lead not found' });
+
+    const editable = ['full_name', 'company_name', 'title', 'email', 'phone', 'notes_summary', 'linkedin_url', 'location'];
+    const requested = Object.fromEntries(editable.filter(field => req.body[field] !== undefined).map(field => [field, req.body[field]]));
+    const normalized = normalizeLead({ ...existing, ...requested, source: existing.source });
+    if (!normalized.full_name) return res.status(400).json({ error: 'Lead name is required' });
+    const emailChanged = requested.email !== undefined && normalizeEmail(requested.email) !== normalizeEmail(existing.email);
+    const phoneChanged = requested.phone !== undefined && clean(requested.phone) !== clean(existing.phone);
+    const { data: agentConfig, error: agentError } = await req.supabase
+      .from('agent_configs').select('*').eq('workspace_id', workspace.id).maybeSingle();
+    if (agentError) throw agentError;
+    const fit = calculateFitScore(normalized, agentConfig || {});
+    const preserveLifecycle = ['selected_for_campaign', 'contacted', 'suppressed'].includes(existing.lifecycle_status);
+    const patch = {
+      ...Object.fromEntries(editable.map(field => [field, normalized[field]])),
+      phone_e164: normalized.phone_e164,
+      fit_score: fit.score,
+      fit_reasons: fit.reasons,
+      lifecycle_status: preserveLifecycle ? existing.lifecycle_status : (usableEmail(normalized.email) ? 'ready' : 'candidate'),
+    };
+    if (emailChanged) {
+      patch.email_source = 'user_edit';
+      patch.email_status = normalized.email ? 'user_provided' : 'unknown';
+      patch.email_updated_at = normalized.email ? new Date().toISOString() : null;
+    }
+    if (phoneChanged) {
+      patch.phone_source = 'user_edit';
+      patch.phone_updated_at = normalized.phone ? new Date().toISOString() : null;
+    }
+
+    const { data, error } = await req.supabase.from('leads').update(patch)
+      .eq('workspace_id', workspace.id).eq('id', existing.id).select('*').single();
+    if (error) throw error;
+    return res.json({ lead: data });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update lead' });
+  }
+});
+
+router.delete('/:leadId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase.from('leads').delete()
+      .eq('workspace_id', workspace.id).eq('id', req.params.leadId).select('id').maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Lead not found' });
+    return res.json({ deleted: true, leadId: data.id });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to delete lead' });
+  }
+});
+
 router.post('/import-csv', async (req, res) => {
   return res.status(410).json({
     error: 'Direct CSV import is retired. Preview the CSV mapping and confirm it through /csv/import.',
@@ -435,13 +497,14 @@ async function processCsvImport({ supabase, user, workspace, run, rows, mappings
 }
 
 router.post('/csv/import', async (req, res) => {
+  let run = null;
   try {
     const mode = req.body.mode === 'suppress' ? 'suppress' : 'import';
     const mappings = Array.isArray(req.body.mappings) ? req.body.mappings : [];
     const parsed = parseCsv(req.body.csv_text || '');
     if (!parsed.rows.length || !mappings.length) return res.status(400).json({ error: 'Confirmed CSV mapping is required' });
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
-    const { data: run, error } = await req.supabase.from('lead_import_runs').insert({
+    const { data, error } = await req.supabase.from('lead_import_runs').insert({
       workspace_id: workspace.id,
       source: 'csv',
       status: 'pending',
@@ -449,6 +512,7 @@ router.post('/csv/import', async (req, res) => {
       raw_meta: { mode, columns: parsed.headers, mappings },
     }).select('*').single();
     if (error) throw error;
+    run = data;
     const queue = getLeadImportQueue();
     await queue.add('csv', {
       runId: run.id,
@@ -458,9 +522,20 @@ router.post('/csv/import', async (req, res) => {
       rows: parsed.rows,
       mappings,
       mode,
-    }, { jobId: `csv:${run.id}` });
+    }, { jobId: createQueueJobId('csv', run.id) });
     return res.status(202).json({ importRun: run });
   } catch (error) {
+    if (run?.id) {
+      try {
+        await req.supabase.from('lead_import_runs').update({
+          status: 'failed',
+          error_message: error.message || 'Failed to queue CSV import',
+          completed_at: new Date().toISOString(),
+        }).eq('id', run.id);
+      } catch (_) {
+        // Preserve the original queue error returned to the caller.
+      }
+    }
     return res.status(500).json({ error: error.message || 'Failed to start CSV import' });
   }
 });

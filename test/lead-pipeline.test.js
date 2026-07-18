@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { applyMapping, parseCsv } = require('../lib/csvLeads');
+const { createQueueJobId } = require('../lib/redis');
 const { calculateFitScore, usableEmail } = require('../routes/leads');
 
 test('CSV parser preserves quoted commas and mapping keeps raw columns', () => {
@@ -41,4 +42,10 @@ test('fit score is deterministic and explainable', () => {
 
   assert.equal(result.score, 100);
   assert.equal(result.reasons.reduce((total, reason) => total + reason.points, 0), 100);
+});
+
+test('BullMQ custom job IDs never contain colons', () => {
+  const id = createQueueJobId('apollo', 'f0d988e1-87dc-453d-adaa-cb1f77373cd3');
+  assert.equal(id, 'apollo-f0d988e1-87dc-453d-adaa-cb1f77373cd3');
+  assert.equal(id.includes(':'), false);
 });

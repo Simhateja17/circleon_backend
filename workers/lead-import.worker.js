@@ -54,6 +54,22 @@ function createWorker() {
     connection: getRedisConnection(),
     concurrency: Number(process.env.LEAD_IMPORT_WORKER_CONCURRENCY || 2),
   });
+  worker.on('ready', () => console.info(JSON.stringify({ event: 'lead_import_worker_ready' })));
+  worker.on('active', job => console.info(JSON.stringify({
+    event: 'lead_import_job_started',
+    jobId: job.id,
+    source: job.name,
+    runId: job.data.runId,
+    workspaceId: job.data.workspaceId,
+  })));
+  worker.on('completed', (job, result) => console.info(JSON.stringify({
+    event: 'lead_import_job_completed',
+    jobId: job.id,
+    source: job.name,
+    runId: job.data.runId,
+    durationMs: job.finishedOn && job.processedOn ? job.finishedOn - job.processedOn : null,
+    result: result || null,
+  })));
   worker.on('failed', (job, error) => console.error(JSON.stringify({ event: 'lead_import_job_failed', jobId: job?.id, error: error.message })));
   return worker;
 }
