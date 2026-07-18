@@ -6,6 +6,7 @@ const { createQueueJobId, getLeadImportQueue } = require('../lib/redis');
 const { findExistingLead, normalizeLead, upsertLeadWithContext, usableEmail } = require('./leads');
 const {
   APOLLO_BLOCK_REASON,
+  APOLLO_INDUSTRIES,
   apolloPersonId,
   buildDefaultFilters,
   enrichOrganizationForPerson,
@@ -331,7 +332,10 @@ router.get('/filters', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const agentConfig = await getAgentConfig(req.supabase, workspace.id);
-    return res.json({ filters: buildDefaultFilters(agentConfig || {}) });
+    return res.json({
+      filters: buildDefaultFilters(agentConfig || {}),
+      industryOptions: APOLLO_INDUSTRIES,
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load Apollo filters' });
   }

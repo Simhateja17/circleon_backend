@@ -102,6 +102,15 @@ const campaignLeadSchema = z.object({
   lead_ids: z.array(z.string().uuid()).max(1000),
 });
 
+const sendNowSchema = z.object({
+  message_ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+const messageEditSchema = z.object({
+  subject: z.string().trim().min(1).max(300),
+  body: z.string().trim().min(1).max(20000),
+});
+
 async function createDefaultSequence(req, campaignId) {
   const { data: existing, error: existingError } = await req.supabase
     .from('email_sequences')
@@ -392,6 +401,91 @@ router.get('/:campaignId/messages', async (req, res) => {
     return res.json({ messages: data || [] });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load campaign messages' });
+  }
+});
+
+router.post('/:campaignId/messages/send-now', async (req, res) => {
+  try {
+    const parsed = sendNowSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Select at least one email to send', details: parsed.error.flatten() });
+
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const messageIds = [...new Set(parsed.data.message_ids)];
+    const [campaign, accountResult, messagesResult] = await Promise.all([
+      loadCampaign(req, workspace.id, req.params.campaignId),
+      req.supabase.from('connected_accounts').select('id, status, smtp_verified_at, imap_verified_at').eq('workspace_id', workspace.id).eq('provider', 'smtp').maybeSingle(),
+      req.supabase.from('messages').select('id, lead_id, status, direction, sequence_step, leads(email, dnc_status, status)').eq('workspace_id', workspace.id).eq('campaign_id', req.params.campaignId).in('id', messageIds),
+    ]);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.status !== 'active') return res.status(400).json({ error: 'Launch the campaign before sending emails immediately' });
+    if (accountResult.error) throw accountResult.error;
+    const account = accountResult.data;
+    if (!account || account.status !== 'connected' || !account.smtp_verified_at || !account.imap_verified_at) {
+      return res.status(400).json({ error: 'Connect and verify both SMTP and IMAP before sending' });
+    }
+    if (messagesResult.error) throw messagesResult.error;
+    const messages = messagesResult.data || [];
+    const sendable = messages.filter(message => (
+      message.direction === 'outbound'
+      && message.sequence_step === 1
+      && ['draft', 'approved'].includes(message.status)
+      && message.leads?.email
+      && message.leads?.dnc_status !== 'blocked'
+      && message.leads?.status !== 'do_not_call'
+    ));
+    if (sendable.length !== messageIds.length) {
+      return res.status(400).json({ error: 'Every selected email must still be an eligible, unsent first-step campaign email' });
+    }
+    const now = new Date().toISOString();
+    const { error: approvalError } = await req.supabase
+      .from('messages')
+      .update({ status: 'approved', approved_by: req.user.id, approved_at: now })
+      .in('id', sendable.map(message => message.id));
+    if (approvalError) throw approvalError;
+    const queue = getEmailSendQueue();
+    await queue.addBulk(sendable.map(message => ({
+      name: 'send-step',
+      data: {
+        workspaceId: workspace.id,
+        campaignId: campaign.id,
+        messageId: message.id,
+        leadId: message.lead_id,
+        sequenceStep: 1,
+        scheduledAt: now,
+      },
+      opts: { jobId: createQueueJobId('send-now', message.id) },
+    })));
+    return res.json({ queued: sendable.length, message_ids: sendable.map(message => message.id) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to queue the selected emails' });
+  }
+});
+
+router.patch('/:campaignId/messages/:messageId', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const parsed = messageEditSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid email content' });
+    const { data: message, error: messageError } = await req.supabase
+      .from('messages')
+      .select('id, status, direction')
+      .eq('workspace_id', workspace.id)
+      .eq('campaign_id', req.params.campaignId)
+      .eq('id', req.params.messageId)
+      .maybeSingle();
+    if (messageError) throw messageError;
+    if (!message || message.direction !== 'outbound') return res.status(404).json({ error: 'Campaign email not found' });
+    if (!['draft', 'approved'].includes(message.status)) return res.status(400).json({ error: `This email cannot be edited because it is ${message.status}` });
+    const { data: updated, error: updateError } = await req.supabase
+      .from('messages')
+      .update({ subject: parsed.data.subject, body: parsed.data.body })
+      .eq('id', message.id)
+      .select()
+      .maybeSingle();
+    if (updateError) throw updateError;
+    return res.json({ message: updated });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update the email' });
   }
 });
 

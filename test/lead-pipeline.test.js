@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { applyMapping, parseCsv } = require('../lib/csvLeads');
 const { createQueueJobId } = require('../lib/redis');
 const { calculateFitScore, usableEmail } = require('../routes/leads');
+const { APOLLO_INDUSTRIES, buildDefaultFilters } = require('../lib/apollo');
 
 test('CSV parser preserves quoted commas and mapping keeps raw columns', () => {
   const parsed = parseCsv('Prospect,Firm,Business Email\n"Doe, Jane",Acme,jane@acme.com\n');
@@ -48,4 +49,12 @@ test('BullMQ custom job IDs never contain colons', () => {
   const id = createQueueJobId('apollo', 'f0d988e1-87dc-453d-adaa-cb1f77373cd3');
   assert.equal(id, 'apollo-f0d988e1-87dc-453d-adaa-cb1f77373cd3');
   assert.equal(id.includes(':'), false);
+});
+
+test('Apollo defaults retain the onboarding industry and provide selectable fallbacks', () => {
+  const filters = buildDefaultFilters({ industry: 'logistics & supply chain' });
+
+  assert.equal(filters.industry, 'logistics & supply chain');
+  assert.equal(APOLLO_INDUSTRIES.includes('information technology & services'), true);
+  assert.equal(APOLLO_INDUSTRIES.includes('logistics & supply chain'), true);
 });
