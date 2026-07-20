@@ -322,9 +322,15 @@ router.put('/:campaignId/leads', async (req, res) => {
       if (error) throw error;
       leads = data || [];
     }
-    const eligible = leads.filter(lead => lead.email && ['ready', 'selected_for_campaign'].includes(lead.lifecycle_status) && lead.dnc_status !== 'blocked');
-    if (eligible.length !== requestedIds.length) {
-      return res.status(400).json({ error: 'Each campaign lead must be ready, have an email, and not be suppressed' });
+    const leadsById = new Map(leads.map(lead => [lead.id, lead]));
+    const ineligible = requestedIds
+      .map(leadId => ({ leadId, reason: leadBlockReason(leadsById.get(leadId)) }))
+      .filter(item => item.reason);
+    if (ineligible.length) {
+      return res.status(400).json({
+        error: ineligible.length === 1 ? ineligible[0].reason : `${ineligible.length} selected leads cannot be added to this campaign`,
+        details: ineligible,
+      });
     }
 
     const existingIds = await loadCampaignLeadIds(req, workspace.id, campaign.id);
