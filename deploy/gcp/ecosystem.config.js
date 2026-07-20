@@ -51,7 +51,9 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         CAMPAIGN_GENERATION_WORKER_CONCURRENCY: 1,
-        CAMPAIGN_GENERATION_CONCURRENCY: 2,
+        CAMPAIGN_GENERATION_CONCURRENCY: 1,
+        GEMINI_REQUESTS_PER_MINUTE: 20,
+        GEMINI_MAX_RETRIES: 3,
       },
       error_file: '/var/log/barsha-backend/campaign-generation-worker-err.log',
       out_file: '/var/log/barsha-backend/campaign-generation-worker-out.log',

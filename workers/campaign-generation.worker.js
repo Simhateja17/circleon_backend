@@ -17,7 +17,7 @@ async function processCampaignGenerationJob(job) {
     campaignId,
     workspaceId,
     leads: leadIds.length,
-    concurrency: Number(process.env.CAMPAIGN_GENERATION_CONCURRENCY || 2),
+    concurrency: Number(process.env.CAMPAIGN_GENERATION_CONCURRENCY || 1),
   }));
 
   const result = await preGenerateSequence({
@@ -25,7 +25,7 @@ async function processCampaignGenerationJob(job) {
     workspaceId,
     campaignId,
     leadIds,
-    concurrency: Number(process.env.CAMPAIGN_GENERATION_CONCURRENCY || 2),
+    concurrency: Number(process.env.CAMPAIGN_GENERATION_CONCURRENCY || 1),
     onProgress: async progress => {
       const payload = { status: 'generating', ...progress };
       await job.updateProgress(payload);
