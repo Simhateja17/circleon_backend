@@ -8,6 +8,7 @@ const {
   APOLLO_BLOCK_REASON,
   APOLLO_INDUSTRIES,
   apolloPersonId,
+  buildPersonalizationProfile,
   buildDefaultFilters,
   enrichOrganizationForPerson,
   extractWebhookUpdates,
@@ -148,9 +149,51 @@ async function requestNextEnrichmentBatch(supabase, run) {
   return { requested: people.length, requestIds: batches.map(batch => batch.request_id).filter(Boolean) };
 }
 
+async function discardUnadmittedEnrichingLeads(supabase, run, reason) {
+  const { data: leads, error: leadError } = await supabase
+    .from('leads')
+    .select('id, external_id, raw_data')
+    .eq('workspace_id', run.workspace_id)
+    .eq('import_run_id', run.id)
+    .eq('lifecycle_status', 'enriching');
+  if (leadError) throw leadError;
+  if (!leads?.length) return 0;
+
+  const { error: auditError } = await supabase.from('apollo_enrichment_audits').insert(leads.map(lead => ({
+    workspace_id: run.workspace_id,
+    import_run_id: run.id,
+    apollo_person_id: lead.external_id || null,
+    outcome: 'not_admitted_no_verified_work_email',
+    raw_response: {
+      reason,
+      apollo_search_person: lead.raw_data?.apollo?.searchPerson || null,
+    },
+  })));
+  if (auditError) throw auditError;
+
+  const completedAt = new Date().toISOString();
+  const { error: requestError } = await supabase
+    .from('apollo_enrichment_requests')
+    .update({ status: 'failed', error_message: reason, completed_at: completedAt })
+    .eq('workspace_id', run.workspace_id)
+    .eq('import_run_id', run.id)
+    .eq('status', 'pending');
+  if (requestError) throw requestError;
+
+  const { error: deleteError } = await supabase
+    .from('leads')
+    .delete()
+    .eq('workspace_id', run.workspace_id)
+    .eq('import_run_id', run.id)
+    .eq('lifecycle_status', 'enriching');
+  if (deleteError) throw deleteError;
+  return leads.length;
+}
+
 async function applyApolloUpdates(supabase, updates) {
   let updated = 0;
   let skipped = 0;
+  let notAdmitted = 0;
   const touchedRuns = new Set();
 
   for (const item of updates) {
@@ -168,16 +211,45 @@ async function applyApolloUpdates(supabase, updates) {
     const canUseApolloEmail = !lead.email || lead.email_source === 'apollo';
     const canonicalEmail = canUseApolloEmail ? item.email : lead.email;
     const emailReady = usableEmail(canonicalEmail);
+    const person = lead.raw_data?.apollo?.searchPerson || {};
+    const enrichedAt = new Date().toISOString();
+
+    if (!emailReady) {
+      const { error: auditError } = await supabase.from('apollo_enrichment_audits').insert({
+        workspace_id: lead.workspace_id,
+        import_run_id: lead.import_run_id,
+        apollo_person_id: lead.external_id || item.personId || null,
+        apollo_request_id: item.requestId || null,
+        outcome: 'not_admitted_no_verified_work_email',
+        raw_response: item.raw || {},
+      });
+      if (auditError) throw auditError;
+
+      const { error: requestError } = await supabase
+        .from('apollo_enrichment_requests')
+        .update({ status: 'failed', raw_response: item.raw, error_message: 'Apollo returned no verified work email', completed_at: enrichedAt })
+        .eq('lead_id', lead.id);
+      if (requestError) throw requestError;
+      const { error: deleteError } = await supabase.from('leads').delete().eq('id', lead.id);
+      if (deleteError) throw deleteError;
+      if (lead.import_run_id) touchedRuns.add(lead.import_run_id);
+      notAdmitted += 1;
+      continue;
+    }
+
+    const companyData = await enrichOrganizationForPerson(person);
     const patch = {
       raw_data: mergeRawData(lead.raw_data, {
         enrichmentWebhook: item.raw,
-        enrichment_status: emailReady ? 'completed' : 'not_found',
+        enrichment_status: 'completed',
       }),
-      callable_block_reason: emailReady ? null : (lead.callable_block_reason || APOLLO_BLOCK_REASON),
-      lifecycle_status: emailReady ? 'ready' : 'rejected_no_email',
-      enrichment_status: emailReady ? 'completed' : 'failed',
-      last_enriched_at: new Date().toISOString(),
-      rejection_reason: emailReady ? null : 'Apollo returned no usable work email',
+      callable_block_reason: null,
+      lifecycle_status: 'ready',
+      enrichment_status: 'completed',
+      last_enriched_at: enrichedAt,
+      rejection_reason: null,
+      company_data: companyData,
+      personalization_profile: buildPersonalizationProfile(person, companyData, enrichedAt),
     };
     if (item.email && canUseApolloEmail) {
       patch.email = item.email;
@@ -211,10 +283,10 @@ async function applyApolloUpdates(supabase, updates) {
     await supabase
       .from('apollo_enrichment_requests')
       .update({
-        status: emailReady ? 'completed' : 'failed',
+        status: 'completed',
         raw_response: item.raw,
-        error_message: emailReady ? null : 'Apollo returned no usable work email',
-        completed_at: new Date().toISOString(),
+        error_message: null,
+        completed_at: enrichedAt,
       })
       .eq('lead_id', lead.id);
 
@@ -246,10 +318,9 @@ async function applyApolloUpdates(supabase, updates) {
       const shouldTopUp = !pending && ready < target;
       const topUp = shouldTopUp ? await requestNextEnrichmentBatch(supabase, run) : { requested: 0, requestIds: [] };
       const hasMore = topUp.requested > 0;
-      if (!pending && ready >= target) {
-        await supabase.from('leads').update({ lifecycle_status: 'candidate', enrichment_status: 'not_started' })
-          .eq('import_run_id', runId).eq('lifecycle_status', 'enriching');
-      }
+      const discarded = !pending && ready >= target
+        ? await discardUnadmittedEnrichingLeads(supabase, run, 'Target reached before verified work email was returned')
+        : 0;
       await updateImportRun(supabase, runId, {
         status: (pending || hasMore) ? 'pending_enrichment' : (ready >= target ? 'completed' : 'partial'),
         completed_at: (pending || hasMore) ? null : new Date().toISOString(),
@@ -266,13 +337,14 @@ async function applyApolloUpdates(supabase, updates) {
           last_webhook_at: new Date().toISOString(),
           ready_count: ready,
           pending_count: pending,
+          not_admitted_count: ((run.raw_meta || {}).not_admitted_count || 0) + discarded,
           latest_top_up_request_ids: topUp.requestIds,
         },
       });
     }
   }
 
-  return { updated, skipped };
+  return { updated, skipped, notAdmitted };
 }
 
 async function pollAndApplyApolloRequests(supabase, requestIds) {
@@ -404,6 +476,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
   let skipped = 0;
   let page = 1;
   const startedAt = new Date().toISOString();
+  const timeoutAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   let progressMeta = {
     ...(run.raw_meta || {}),
     stage: 'starting',
@@ -414,6 +487,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     target_ready_count: target,
     candidate_cap: candidateCap,
     page_cap: pageCap,
+    timeout_at: timeoutAt,
   };
 
   async function reportProgress(status, metaPatch = {}, rowPatch = {}) {
@@ -421,6 +495,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     const updated = await updateImportRun(supabase, run.id, {
       status,
       raw_meta: progressMeta,
+      progress: progressMeta,
       ...rowPatch,
     });
     debug('import_progress', {
@@ -442,7 +517,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
       stage: 'searching',
       stage_label: 'Searching Apollo for matching people',
       current_page: page,
-    });
+    }, { started_at: startedAt, timeout_at: timeoutAt, completed_at: null });
 
     const { data: suppressions, error: suppressionError } = await supabase
       .from('lead_suppressions')
@@ -452,6 +527,9 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     if (suppressionError) throw suppressionError;
 
     while (page <= pageCap && candidatePeople.length < candidateCap) {
+      if (Date.now() >= new Date(timeoutAt).getTime()) {
+        throw new Error('Apollo did not finish in time. Start a fresh import.');
+      }
       debug('search_page_started', { runId: run.id, page, candidateCount: candidatePeople.length, candidateCap });
       const search = await searchPeople(filters, page, 100);
       searched += search.people.length;
@@ -514,6 +592,9 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
     });
     const requestIds = [];
     for (let offset = 0; offset < candidatePeople.length; offset += 10) {
+      if (Date.now() >= new Date(timeoutAt).getTime()) {
+        throw new Error('Apollo did not finish in time. Start a fresh import.');
+      }
       const batchPeople = candidatePeople.slice(offset, offset + 10);
       const batchNumber = Math.floor(offset / 10) + 1;
       await reportProgress('enriching', {
@@ -573,6 +654,10 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
       completed_at: pending ? null : new Date().toISOString(),
     });
   } catch (error) {
+    const timedOut = error.message === 'Apollo did not finish in time. Start a fresh import.';
+    if (timedOut) {
+      await discardUnadmittedEnrichingLeads(supabase, run, error.message).catch(() => undefined);
+    }
     await updateImportRun(supabase, run.id, {
       status: 'failed',
       error_message: error.message || 'Apollo import failed',
@@ -581,6 +666,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
         ...progressMeta,
         stage: 'failed',
         stage_label: 'Apollo import failed',
+        timeout_at: timeoutAt,
         eta_seconds: 0,
         last_progress_at: new Date().toISOString(),
         apollo_error: error.payload || null,

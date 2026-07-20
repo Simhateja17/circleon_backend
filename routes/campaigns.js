@@ -1,17 +1,16 @@
 const express = require('express');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
-const { getPreviewMessages, preGenerateStep1 } = require('../lib/emailSequence');
+const { getPreviewMessages, preGenerateStep1, regenerateStep1Message } = require('../lib/emailSequence');
 const { createQueueJobId, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
-const { enrichOrganizationForPerson } = require('../lib/apollo');
 
 const router = express.Router();
 
 const DEFAULT_SEQUENCE_STEPS = [
-  { step_number: 1, name: 'Intro', delay_days: 0 },
-  { step_number: 2, name: 'Bump', delay_days: 3 },
-  { step_number: 3, name: 'Breakup', delay_days: 7 },
+  { step_number: 1, name: 'Intro', delay_days: 0, ai_instruction: 'Write a concise first touch. Use one factual, relevant company insight and invite a short conversation.' },
+  { step_number: 2, name: 'Bump', delay_days: 3, ai_instruction: 'Write a brief follow-up that adds one useful angle without repeating the first email.' },
+  { step_number: 3, name: 'Breakup', delay_days: 7, ai_instruction: 'Write a polite final follow-up with a low-pressure close.' },
 ];
 
 function parseTime(value, fallbackHour) {
@@ -102,6 +101,20 @@ const campaignLeadSchema = z.object({
   lead_ids: z.array(z.string().uuid()).max(1000),
 });
 
+const campaignUpdateSchema = campaignSchema.partial().omit({ import_run_id: true, lead_source: true });
+
+const sequenceStepSchema = z.object({
+  id: z.string().uuid().optional(),
+  step_number: z.number().int().min(1).max(12),
+  name: z.string().trim().min(1).max(80),
+  delay_days: z.number().int().min(0).max(365),
+  ai_instruction: z.string().trim().min(1).max(2000),
+});
+
+const sequenceSchema = z.object({
+  steps: z.array(sequenceStepSchema).min(1).max(12),
+});
+
 const sendNowSchema = z.object({
   message_ids: z.array(z.string().uuid()).min(1).max(500),
 });
@@ -109,6 +122,10 @@ const sendNowSchema = z.object({
 const messageEditSchema = z.object({
   subject: z.string().trim().min(1).max(300),
   body: z.string().trim().min(1).max(20000),
+});
+
+const approvalSchema = z.object({
+  message_ids: z.array(z.string().uuid()).min(1).max(500),
 });
 
 async function createDefaultSequence(req, campaignId) {
@@ -172,6 +189,14 @@ async function restoreUnassignedLeadLifecycle(req, workspaceId, leadIds) {
     .eq('lifecycle_status', 'selected_for_campaign')
     .in('id', unassigned);
   if (error) throw error;
+}
+
+function leadBlockReason(lead) {
+  if (!lead) return 'Lead was not found in this workspace';
+  if (lead.dnc_status === 'blocked' || lead.lifecycle_status === 'suppressed') return 'Lead is suppressed and cannot be contacted';
+  if (!lead.email) return 'Lead does not have a verified work email';
+  if (!['ready', 'selected_for_campaign'].includes(lead.lifecycle_status)) return 'Lead is not ready for a campaign yet';
+  return null;
 }
 
 router.use(requireAuth);
@@ -241,6 +266,24 @@ router.get('/:campaignId', async (req, res) => {
     return res.json({ campaign });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load campaign' });
+  }
+});
+
+router.patch('/:campaignId', async (req, res) => {
+  try {
+    const parsed = campaignUpdateSchema.safeParse(req.body?.campaign || req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid campaign settings', details: parsed.error.flatten() });
+    if (!Object.keys(parsed.data).length) return res.status(400).json({ error: 'Provide at least one campaign setting to update' });
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) return res.status(400).json({ error: 'Pause the campaign before changing its settings' });
+    const { data, error } = await req.supabase.from('campaigns').update(parsed.data)
+      .eq('workspace_id', workspace.id).eq('id', campaign.id).select('*').single();
+    if (error) throw error;
+    return res.json({ campaign: await loadCampaign(req, workspace.id, data.id) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update campaign settings' });
   }
 });
 
@@ -316,6 +359,65 @@ router.put('/:campaignId/leads', async (req, res) => {
   }
 });
 
+router.put('/:campaignId/sequences', async (req, res) => {
+  try {
+    const parsed = sequenceSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid sequence payload', details: parsed.error.flatten() });
+
+    const stepNumbers = parsed.data.steps.map(step => step.step_number);
+    if (new Set(stepNumbers).size !== stepNumbers.length) {
+      return res.status(400).json({ error: 'Each sequence step needs a unique step number' });
+    }
+
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Pause the campaign before changing its sequence' });
+    }
+
+    const nextSteps = [...parsed.data.steps].sort((a, b) => a.step_number - b.step_number);
+    const existingSteps = campaign.email_sequences || [];
+    const retainedNumbers = new Set(nextSteps.map(step => step.step_number));
+    const removedNumbers = existingSteps.map(step => step.step_number).filter(number => !retainedNumbers.has(number));
+
+    if (removedNumbers.length) {
+      const { error: messageError } = await req.supabase
+        .from('messages')
+        .delete()
+        .eq('workspace_id', workspace.id)
+        .eq('campaign_id', campaign.id)
+        .eq('direction', 'outbound')
+        .in('sequence_step', removedNumbers)
+        .in('status', ['draft', 'pending_approval', 'approved']);
+      if (messageError) throw messageError;
+
+      const { error: sequenceError } = await req.supabase
+        .from('email_sequences')
+        .delete()
+        .eq('campaign_id', campaign.id)
+        .in('step_number', removedNumbers);
+      if (sequenceError) throw sequenceError;
+    }
+
+    const { error } = await req.supabase
+      .from('email_sequences')
+      .upsert(nextSteps.map(step => ({
+        campaign_id: campaign.id,
+        step_number: step.step_number,
+        name: step.name,
+        delay_days: step.delay_days,
+        ai_instruction: step.ai_instruction,
+        status: 'draft',
+      })), { onConflict: 'campaign_id,step_number' });
+    if (error) throw error;
+
+    return res.json({ campaign: await loadCampaign(req, workspace.id, campaign.id), removed_steps: removedNumbers });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update campaign sequence' });
+  }
+});
+
 router.post('/:campaignId/generate', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
@@ -332,39 +434,26 @@ router.post('/:campaignId/generate', async (req, res) => {
       .eq('workspace_id', workspace.id)
       .in('id', selectedLeadIds);
     if (leadError) throw leadError;
-    const eligible = (leads || []).filter(lead => ['ready', 'selected_for_campaign'].includes(lead.lifecycle_status) && lead.dnc_status !== 'blocked' && lead.email);
-    if (eligible.length !== selectedLeadIds.length) {
-      return res.status(400).json({ error: 'Every selected lead must be ready, have an email, and not be suppressed' });
-    }
-
-    for (const lead of eligible) {
-      if (lead.source !== 'apollo') continue;
-      if (lead.company_data?.enrichment_source === 'apollo_organization') continue;
-      const person = lead.raw_data?.apollo?.searchPerson;
-      if (!person) continue;
-      const companyData = await enrichOrganizationForPerson(person);
-      const { error: enrichError } = await req.supabase.from('leads').update({
-        company_data: {
-          ...(lead.company_data || {}),
-          ...(companyData || {}),
-          enrichment_source: 'apollo_organization',
-          enriched_at: new Date().toISOString(),
-        },
-      }).eq('id', lead.id);
-      if (enrichError) throw enrichError;
+    const leadsById = new Map((leads || []).map(lead => [lead.id, lead]));
+    const blocked = selectedLeadIds
+      .map(leadId => ({ lead_id: leadId, reason: leadBlockReason(leadsById.get(leadId)) }))
+      .filter(item => item.reason);
+    const eligibleLeadIds = selectedLeadIds.filter(leadId => !blocked.some(item => item.lead_id === leadId));
+    if (!eligibleLeadIds.length) {
+      return res.status(400).json({ error: 'No selected leads are ready with a verified work email', blocked });
     }
 
     const result = await preGenerateStep1({
       supabase: req.supabase,
       workspaceId: workspace.id,
       campaignId: campaign.id,
-      leadIds: selectedLeadIds,
+      leadIds: eligibleLeadIds,
     });
     const [savedCampaign, messages] = await Promise.all([
       loadCampaign(req, workspace.id, campaign.id),
       getPreviewMessages({ supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, limit: 100 }),
     ]);
-    return res.json({ campaign: savedCampaign, messages, result });
+    return res.json({ campaign: savedCampaign, messages, result: { ...result, blocked } });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to generate campaign emails' });
   }
@@ -404,6 +493,30 @@ router.get('/:campaignId/messages', async (req, res) => {
   }
 });
 
+router.post('/:campaignId/messages/approve-batch', async (req, res) => {
+  try {
+    const parsed = approvalSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Select at least one draft to approve', details: parsed.error.flatten() });
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    const ids = [...new Set(parsed.data.message_ids)];
+    const { data: messages, error: messageError } = await req.supabase.from('messages')
+      .select('id, status, direction').eq('workspace_id', workspace.id).eq('campaign_id', campaign.id).in('id', ids);
+    if (messageError) throw messageError;
+    const approvable = (messages || []).filter(message => message.direction === 'outbound' && message.status === 'draft');
+    if (approvable.length !== ids.length) return res.status(400).json({ error: 'Only unsent outbound drafts can be approved' });
+    const now = new Date().toISOString();
+    const { data, error } = await req.supabase.from('messages').update({
+      status: 'approved', approved_by: req.user.id, approved_at: now, approved_source: 'batch',
+    }).in('id', ids).select('*');
+    if (error) throw error;
+    return res.json({ approved: data?.length || 0, messages: data || [] });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to approve campaign emails' });
+  }
+});
+
 router.post('/:campaignId/messages/send-now', async (req, res) => {
   try {
     const parsed = sendNowSchema.safeParse(req.body || {});
@@ -428,7 +541,7 @@ router.post('/:campaignId/messages/send-now', async (req, res) => {
     const sendable = messages.filter(message => (
       message.direction === 'outbound'
       && message.sequence_step === 1
-      && ['draft', 'approved'].includes(message.status)
+      && message.status === 'approved'
       && message.leads?.email
       && message.leads?.dnc_status !== 'blocked'
       && message.leads?.status !== 'do_not_call'
@@ -437,11 +550,6 @@ router.post('/:campaignId/messages/send-now', async (req, res) => {
       return res.status(400).json({ error: 'Every selected email must still be an eligible, unsent first-step campaign email' });
     }
     const now = new Date().toISOString();
-    const { error: approvalError } = await req.supabase
-      .from('messages')
-      .update({ status: 'approved', approved_by: req.user.id, approved_at: now })
-      .in('id', sendable.map(message => message.id));
-    if (approvalError) throw approvalError;
     const queue = getEmailSendQueue();
     await queue.addBulk(sendable.map(message => ({
       name: 'send-step',
@@ -478,7 +586,15 @@ router.patch('/:campaignId/messages/:messageId', async (req, res) => {
     if (!['draft', 'approved'].includes(message.status)) return res.status(400).json({ error: `This email cannot be edited because it is ${message.status}` });
     const { data: updated, error: updateError } = await req.supabase
       .from('messages')
-      .update({ subject: parsed.data.subject, body: parsed.data.body })
+      .update({
+        subject: parsed.data.subject,
+        body: parsed.data.body,
+        status: 'draft',
+        approved_by: null,
+        approved_at: null,
+        manually_edited_at: new Date().toISOString(),
+        manually_edited_by: req.user.id,
+      })
       .eq('id', message.id)
       .select()
       .maybeSingle();
@@ -486,6 +602,21 @@ router.patch('/:campaignId/messages/:messageId', async (req, res) => {
     return res.json({ message: updated });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to update the email' });
+  }
+});
+
+router.post('/:campaignId/messages/:messageId/regenerate', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) return res.status(400).json({ error: 'Pause the campaign before regenerating a draft' });
+    const message = await regenerateStep1Message({
+      supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, messageId: req.params.messageId,
+    });
+    return res.json({ message });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to regenerate the campaign email' });
   }
 });
 
@@ -507,13 +638,11 @@ router.post('/:campaignId/messages/:messageId/send-now', async (req, res) => {
     if (messageResult.error) throw messageResult.error;
     const message = messageResult.data;
     if (!message || message.direction !== 'outbound' || message.sequence_step !== 1) return res.status(404).json({ error: 'Campaign email not found' });
-    if (!['draft', 'approved'].includes(message.status)) return res.status(400).json({ error: `This email cannot be sent now because it is ${message.status}` });
+    if (message.status !== 'approved') return res.status(400).json({ error: `Approve this email before sending it; it is currently ${message.status}` });
     if (!message.leads?.email || message.leads?.dnc_status === 'blocked' || message.leads?.status === 'do_not_call') {
       return res.status(400).json({ error: 'This lead cannot receive email' });
     }
     const now = new Date().toISOString();
-    const { error: approvalError } = await req.supabase.from('messages').update({ status: 'approved', approved_by: req.user.id, approved_at: now }).eq('id', message.id);
-    if (approvalError) throw approvalError;
     const queue = getEmailSendQueue();
     await queue.add('send-step', {
       workspaceId: workspace.id,
@@ -565,11 +694,11 @@ router.post('/:campaignId/launch', async (req, res) => {
       .eq('campaign_id', campaign.id)
       .eq('direction', 'outbound')
       .eq('sequence_step', 1)
-      .in('status', ['draft', 'approved']);
+      .eq('status', 'approved');
 
     if (messageError) throw messageError;
     if (!messages?.length) {
-      return res.status(400).json({ error: 'Generate step 1 emails before launching' });
+      return res.status(400).json({ error: 'Approve at least one generated email before launching' });
     }
 
     const now = new Date().toISOString();
@@ -584,18 +713,6 @@ router.post('/:campaignId/launch', async (req, res) => {
       .single();
 
     if (updateCampaignError) throw updateCampaignError;
-
-    const messageIds = messages.map(message => message.id);
-    const { error: updateMessagesError } = await req.supabase
-      .from('messages')
-      .update({
-        status: 'approved',
-        approved_by: req.user.id,
-        approved_at: now,
-      })
-      .in('id', messageIds);
-
-    if (updateMessagesError) throw updateMessagesError;
 
     const queue = getEmailSendQueue();
     await queue.addBulk(buildSendJobs({
