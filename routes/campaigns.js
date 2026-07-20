@@ -2,7 +2,7 @@ const express = require('express');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = require('../lib/emailSequence');
-const { createQueueJobId, getEmailSendQueue } = require('../lib/redis');
+const { createQueueJobId, getCampaignGenerationQueue, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 
 const router = express.Router();
@@ -478,6 +478,19 @@ router.put('/:campaignId/sequences', async (req, res) => {
   }
 });
 
+async function generationSnapshot(queue, campaignId) {
+  const jobId = createQueueJobId('campaign-generate', campaignId);
+  const job = await queue.getJob(jobId);
+  if (!job) return { job_id: null, status: 'idle', progress: null };
+  const state = await job.getState();
+  return {
+    job_id: job.id,
+    status: state,
+    progress: job.progress || null,
+    failed_reason: job.failedReason || null,
+  };
+}
+
 router.post('/:campaignId/generate', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
@@ -503,19 +516,64 @@ router.post('/:campaignId/generate', async (req, res) => {
       return res.status(400).json({ error: 'No selected leads are ready with a verified work email', blocked });
     }
 
-    const result = await preGenerateSequence({
-      supabase: req.supabase,
+    const queue = getCampaignGenerationQueue();
+    const jobId = createQueueJobId('campaign-generate', campaign.id);
+    const existingJob = await queue.getJob(jobId);
+    const existingState = existingJob ? await existingJob.getState() : null;
+    if (existingJob && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingState)) {
+      console.info(JSON.stringify({
+        event: 'campaign_generation_reused',
+        campaignId: campaign.id,
+        workspaceId: workspace.id,
+        jobId,
+        status: existingState,
+      }));
+      return res.json({ campaign, generation: await generationSnapshot(queue, campaign.id), blocked });
+    }
+    if (existingJob) await existingJob.remove();
+    await queue.add('generate-sequence', {
       workspaceId: workspace.id,
       campaignId: campaign.id,
       leadIds: eligibleLeadIds,
+    }, { jobId });
+    console.info(JSON.stringify({
+      event: 'campaign_generation_queued',
+      campaignId: campaign.id,
+      workspaceId: workspace.id,
+      jobId,
+      selectedLeads: selectedLeadIds.length,
+      eligibleLeads: eligibleLeadIds.length,
+      blockedLeads: blocked.length,
+      sequenceSteps: campaign.email_sequences?.length || 1,
+    }));
+    return res.status(202).json({
+      campaign,
+      generation: { job_id: jobId, status: 'waiting', progress: { total: eligibleLeadIds.length, processed: 0, generated: 0, skipped: 0, failed: 0 } },
+      blocked,
     });
-    const [savedCampaign, messages] = await Promise.all([
-      loadCampaign(req, workspace.id, campaign.id),
-      getPreviewMessages({ supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, limit: 100 }),
-    ]);
-    return res.json({ campaign: savedCampaign, messages, result: { ...result, blocked } });
   } catch (error) {
+    console.error(JSON.stringify({
+      event: 'campaign_generation_queue_failed',
+      campaignId: req.params.campaignId,
+      error: error.message || 'Failed to generate campaign emails',
+    }));
     return res.status(500).json({ error: error.message || 'Failed to generate campaign emails' });
+  }
+});
+
+router.get('/:campaignId/generation', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    const queue = getCampaignGenerationQueue();
+    const [generation, preview] = await Promise.all([
+      generationSnapshot(queue, campaign.id),
+      getPreviewMessages({ supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, limit: 500 }),
+    ]);
+    return res.json({ generation: { ...generation, generated_messages: preview.length } });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load generation status' });
   }
 });
 
@@ -526,7 +584,7 @@ router.get('/:campaignId/preview', async (req, res) => {
       supabase: req.supabase,
       workspaceId: workspace.id,
       campaignId: req.params.campaignId,
-      limit: 100,
+      limit: 500,
     });
 
     return res.json({ messages });
