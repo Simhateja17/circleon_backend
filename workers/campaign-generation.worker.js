@@ -4,6 +4,7 @@ const { Worker } = require('bullmq');
 const { createServiceClient } = require('../lib/supabase');
 const { getRedisConnection } = require('../lib/redis');
 const { preGenerateSequence } = require('../lib/emailSequence');
+const { getAiModelName, getAiProvider } = require('../lib/gemini');
 
 async function processCampaignGenerationJob(job) {
   const service = createServiceClient();
@@ -18,6 +19,8 @@ async function processCampaignGenerationJob(job) {
     workspaceId,
     leads: leadIds.length,
     concurrency: Number(process.env.CAMPAIGN_GENERATION_CONCURRENCY || 1),
+    aiProvider: getAiProvider(),
+    aiModel: getAiModelName(),
   }));
 
   const result = await preGenerateSequence({
@@ -54,7 +57,11 @@ function createWorker() {
     connection: getRedisConnection(),
     concurrency: Number(process.env.CAMPAIGN_GENERATION_WORKER_CONCURRENCY || 1),
   });
-  worker.on('ready', () => console.info(JSON.stringify({ event: 'campaign_generation_worker_ready' })));
+  worker.on('ready', () => console.info(JSON.stringify({
+    event: 'campaign_generation_worker_ready',
+    aiProvider: getAiProvider(),
+    aiModel: getAiModelName(),
+  })));
   worker.on('active', job => console.info(JSON.stringify({ event: 'campaign_generation_started', jobId: job.id, campaignId: job.data.campaignId, workspaceId: job.data.workspaceId })));
   worker.on('failed', (job, error) => console.error(JSON.stringify({
     event: 'campaign_generation_failed',
