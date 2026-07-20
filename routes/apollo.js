@@ -133,14 +133,18 @@ async function findLeadForApolloUpdate(supabase, item) {
 async function requestNextEnrichmentBatch(supabase, run) {
   const target = Number(run.raw_meta?.requested_limit || run.total_rows || 0);
   const cap = Number(run.raw_meta?.candidate_cap || Math.min(target * 3, 300));
-  const [{ data: candidates, error: candidateError }, { data: requests, error: requestError }] = await Promise.all([
+  const [{ data: candidates, error: candidateError }, { data: requests, error: requestError }, { count: readyCount, error: readyError }] = await Promise.all([
     supabase.from('leads').select('id, external_id, raw_data').eq('import_run_id', run.id).eq('lifecycle_status', 'enriching').limit(cap),
     supabase.from('apollo_enrichment_requests').select('lead_id').eq('import_run_id', run.id),
+    supabase.from('leads').select('id', { count: 'exact', head: true }).eq('import_run_id', run.id).eq('lifecycle_status', 'ready'),
   ]);
   if (candidateError) throw candidateError;
   if (requestError) throw requestError;
+  if (readyError) throw readyError;
+  const remaining = Math.max(0, target - (readyCount || 0));
+  if (!remaining) return { requested: 0, requestIds: [] };
   const requestedLeadIds = new Set((requests || []).map(row => row.lead_id));
-  const next = (candidates || []).filter(lead => !requestedLeadIds.has(lead.id)).slice(0, 10);
+  const next = (candidates || []).filter(lead => !requestedLeadIds.has(lead.id)).slice(0, Math.min(10, remaining));
   const people = next.map(lead => lead.raw_data?.apollo?.searchPerson).filter(Boolean);
   if (!people.length) return { requested: 0, requestIds: [] };
   const leadByPersonId = new Map(next.map(lead => [lead.external_id, lead.id]));
@@ -163,7 +167,7 @@ async function discardUnadmittedEnrichingLeads(supabase, run, reason) {
     workspace_id: run.workspace_id,
     import_run_id: run.id,
     apollo_person_id: lead.external_id || null,
-    outcome: 'not_admitted_no_verified_work_email',
+      outcome: 'not_admitted_target_reached',
     raw_response: {
       reason,
       apollo_search_person: lead.raw_data?.apollo?.searchPerson || null,
@@ -188,6 +192,32 @@ async function discardUnadmittedEnrichingLeads(supabase, run, reason) {
     .eq('lifecycle_status', 'enriching');
   if (deleteError) throw deleteError;
   return leads.length;
+}
+
+async function trimReadyLeadsToTarget(supabase, run, target) {
+  const { data: readyLeads, error } = await supabase
+    .from('leads')
+    .select('id, external_id, raw_data, created_at')
+    .eq('workspace_id', run.workspace_id)
+    .eq('import_run_id', run.id)
+    .eq('lifecycle_status', 'ready')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  const overflow = (readyLeads || []).slice(target);
+  if (!overflow.length) return 0;
+
+  const { error: auditError } = await supabase.from('apollo_enrichment_audits').insert(overflow.map(lead => ({
+    workspace_id: run.workspace_id,
+    import_run_id: run.id,
+    apollo_person_id: lead.external_id || null,
+    outcome: 'not_admitted_target_reached',
+    raw_response: { reason: `Import target of ${target} verified work-email leads was reached`, apollo_search_person: lead.raw_data?.apollo?.searchPerson || null },
+  })));
+  if (auditError) throw auditError;
+
+  const { error: deleteError } = await supabase.from('leads').delete().in('id', overflow.map(lead => lead.id));
+  if (deleteError) throw deleteError;
+  return overflow.length;
 }
 
 async function applyApolloUpdates(supabase, updates) {
@@ -313,7 +343,8 @@ async function applyApolloUpdates(supabase, updates) {
         supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('import_run_id', runId).eq('status', 'pending'),
       ]);
       const target = Number(run.raw_meta?.requested_limit || run.total_rows || 0);
-      const ready = readyCount || 0;
+      const overflow = (readyCount || 0) > target ? await trimReadyLeadsToTarget(supabase, run, target) : 0;
+      const ready = Math.min(readyCount || 0, target);
       const pending = pendingCount || 0;
       const shouldTopUp = !pending && ready < target;
       const topUp = shouldTopUp ? await requestNextEnrichmentBatch(supabase, run) : { requested: 0, requestIds: [] };
@@ -338,6 +369,7 @@ async function applyApolloUpdates(supabase, updates) {
           ready_count: ready,
           pending_count: pending,
           not_admitted_count: ((run.raw_meta || {}).not_admitted_count || 0) + discarded,
+          target_overflow_discarded: ((run.raw_meta || {}).target_overflow_discarded || 0) + overflow,
           latest_top_up_request_ids: topUp.requestIds,
         },
       });
@@ -580,7 +612,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
       page += 1;
     }
 
-    const totalBatches = Math.ceil(candidatePeople.length / 10);
+    const totalBatches = Math.ceil(target / 10);
     await reportProgress('enriching', {
       stage: 'enriching',
       stage_label: 'Enriching work emails in credit-safe batches',
@@ -595,7 +627,17 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
       if (Date.now() >= new Date(timeoutAt).getTime()) {
         throw new Error('Apollo did not finish in time. Start a fresh import.');
       }
-      const batchPeople = candidatePeople.slice(offset, offset + 10);
+      const { count: readyBeforeBatch, error: readyBeforeBatchError } = await supabase
+        .from('leads')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', workspace.id)
+        .eq('import_run_id', run.id)
+        .eq('lifecycle_status', 'ready');
+      if (readyBeforeBatchError) throw readyBeforeBatchError;
+      const remaining = Math.max(0, target - (readyBeforeBatch || 0));
+      if (!remaining) break;
+      const batchPeople = candidatePeople.slice(offset, offset + Math.min(10, remaining));
+      if (!batchPeople.length) break;
       const batchNumber = Math.floor(offset / 10) + 1;
       await reportProgress('enriching', {
         stage: 'enriching',
