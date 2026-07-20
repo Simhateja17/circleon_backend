@@ -1,7 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
-const { getPreviewMessages, preGenerateStep1, regenerateStep1Message } = require('../lib/emailSequence');
+const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = require('../lib/emailSequence');
 const { createQueueJobId, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 
@@ -86,6 +86,12 @@ function buildSendJobs({ messages, campaign, workspaceId, now = new Date() }) {
   });
 }
 
+const campaignBriefSchema = z.object({
+  campaign_angle: z.string().trim().max(1200).optional().default(''),
+  cta: z.string().trim().max(500).optional().default(''),
+  tone: z.string().trim().max(120).optional().default(''),
+});
+
 const campaignSchema = z.object({
   name: z.string().trim().min(1).max(120),
   lead_source: z.enum(['apollo', 'csv', 'manual']).default('manual'),
@@ -95,6 +101,7 @@ const campaignSchema = z.object({
   active_days: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([1, 2, 3, 4, 5]),
   daily_send_cap: z.number().int().min(1).max(500).default(100),
   cadence_per_hour: z.number().int().min(1).max(100).default(25),
+  brief: campaignBriefSchema.optional(),
 });
 
 const campaignLeadSchema = z.object({
@@ -102,6 +109,25 @@ const campaignLeadSchema = z.object({
 });
 
 const campaignUpdateSchema = campaignSchema.partial().omit({ import_run_id: true, lead_source: true });
+
+function campaignBrief(agentConfig, brief = {}) {
+  return {
+    agent_config: {
+      agent_name: agentConfig?.agent_name || null,
+      company_name: agentConfig?.company_name || null,
+      product: agentConfig?.product || null,
+      value_proposition: agentConfig?.value_proposition || null,
+      target_titles: agentConfig?.target_titles || [],
+      target_regions: agentConfig?.target_regions || null,
+      objections: agentConfig?.objections || null,
+      tone: agentConfig?.tone || null,
+      booking_link: agentConfig?.booking_link || null,
+    },
+    campaign_angle: brief.campaign_angle || '',
+    cta: brief.cta || agentConfig?.booking_link || '',
+    tone: brief.tone || agentConfig?.tone || '',
+  };
+}
 
 const sequenceStepSchema = z.object({
   id: z.string().uuid().optional(),
@@ -230,10 +256,17 @@ router.post('/', async (req, res) => {
 
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const payload = parsed.data;
+    const { data: agentConfig, error: agentConfigError } = await req.supabase
+      .from('agent_configs')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .maybeSingle();
+    if (agentConfigError) throw agentConfigError;
     const { data: campaign, error } = await req.supabase
       .from('campaigns')
       .insert({
         ...payload,
+        brief: campaignBrief(agentConfig, payload.brief),
         import_run_id: payload.import_run_id || null,
         workspace_id: workspace.id,
         channel: 'email',
@@ -386,6 +419,27 @@ router.put('/:campaignId/sequences', async (req, res) => {
     const existingSteps = campaign.email_sequences || [];
     const retainedNumbers = new Set(nextSteps.map(step => step.step_number));
     const removedNumbers = existingSteps.map(step => step.step_number).filter(number => !retainedNumbers.has(number));
+    const existingByNumber = new Map(existingSteps.map(step => [step.step_number, step]));
+    const changedFrom = nextSteps.reduce((firstChanged, step) => {
+      const existing = existingByNumber.get(step.step_number);
+      const changed = !existing
+        || existing.name !== step.name
+        || Number(existing.delay_days) !== Number(step.delay_days)
+        || (existing.ai_instruction || '') !== step.ai_instruction;
+      return changed ? Math.min(firstChanged, step.step_number) : firstChanged;
+    }, removedNumbers.length ? Math.min(...removedNumbers) : Number.POSITIVE_INFINITY);
+
+    if (Number.isFinite(changedFrom)) {
+      const { error: staleMessageError } = await req.supabase
+        .from('messages')
+        .delete()
+        .eq('workspace_id', workspace.id)
+        .eq('campaign_id', campaign.id)
+        .eq('direction', 'outbound')
+        .gte('sequence_step', changedFrom)
+        .in('status', ['draft', 'pending_approval', 'approved']);
+      if (staleMessageError) throw staleMessageError;
+    }
 
     if (removedNumbers.length) {
       const { error: messageError } = await req.supabase
@@ -449,7 +503,7 @@ router.post('/:campaignId/generate', async (req, res) => {
       return res.status(400).json({ error: 'No selected leads are ready with a verified work email', blocked });
     }
 
-    const result = await preGenerateStep1({
+    const result = await preGenerateSequence({
       supabase: req.supabase,
       workspaceId: workspace.id,
       campaignId: campaign.id,
@@ -582,7 +636,7 @@ router.patch('/:campaignId/messages/:messageId', async (req, res) => {
     if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid email content' });
     const { data: message, error: messageError } = await req.supabase
       .from('messages')
-      .select('id, status, direction')
+      .select('id, lead_id, sequence_step, status, direction')
       .eq('workspace_id', workspace.id)
       .eq('campaign_id', req.params.campaignId)
       .eq('id', req.params.messageId)
@@ -605,6 +659,16 @@ router.patch('/:campaignId/messages/:messageId', async (req, res) => {
       .select()
       .maybeSingle();
     if (updateError) throw updateError;
+    const { error: downstreamError } = await req.supabase
+      .from('messages')
+      .delete()
+      .eq('workspace_id', workspace.id)
+      .eq('campaign_id', req.params.campaignId)
+      .eq('lead_id', message.lead_id)
+      .eq('direction', 'outbound')
+      .gt('sequence_step', message.sequence_step)
+      .in('status', ['draft', 'pending_approval', 'approved']);
+    if (downstreamError) throw downstreamError;
     return res.json({ message: updated });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to update the email' });
@@ -617,7 +681,7 @@ router.post('/:campaignId/messages/:messageId/regenerate', async (req, res) => {
     const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
     if (!['draft', 'paused'].includes(campaign.status)) return res.status(400).json({ error: 'Pause the campaign before regenerating a draft' });
-    const message = await regenerateStep1Message({
+    const message = await regenerateSequenceMessage({
       supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, messageId: req.params.messageId,
     });
     return res.json({ message });
