@@ -1,0 +1,77 @@
+name: Backend CI and Deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Test backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Check executable entry points
+        run: |
+          node --check server.js
+          node --check routes/inbox.js
+          node --check workers/poll-inbox.worker.js
+          node --check workers/send-email.worker.js
+
+  deploy-production:
+    name: Deploy to GCP VM
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: backend-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure production SSH access
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Sync backend release
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude='.env' \
+            --exclude='node_modules' \
+            --exclude='.git' \
+            --exclude='.ssh' \
+            --exclude='.bash*' \
+            --exclude='.profile' \
+            --exclude='.pm2' \
+            --exclude='.npm' \
+            -e 'ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes' \
+            ./ "${DEPLOY_USER}@${DEPLOY_HOST}:/opt/barsha-backend/"
+      - name: Install release and reload PM2 workers
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            'cd /opt/barsha-backend && npm ci --omit=dev && pm2 reload deploy/gcp/ecosystem.config.js --update-env && pm2 save && pm2 status'

@@ -101,6 +101,21 @@ The script:
 | Enable startup | `pm2 startup` / `pm2 save` |
 | Caddy logs | `sudo journalctl -u caddy -f` |
 
+## GitHub Actions deployment
+
+`../../.github/workflows/ci-cd.yml` tests every pull request and every push to `main`. After a successful push to `main`, it deploys to this VM and reloads every PM2 process defined in `ecosystem.config.js`.
+
+Create a protected GitHub environment named `production`, then add these secrets there:
+
+| Secret | Value |
+|---|---|
+| `DEPLOY_HOST` | VM DNS name or static external IP |
+| `DEPLOY_USER` | `barsha` |
+| `DEPLOY_SSH_PRIVATE_KEY` | Dedicated deployment SSH private key |
+| `DEPLOY_SSH_KNOWN_HOSTS` | `ssh-keyscan -H <DEPLOY_HOST>` output, reviewed before saving |
+
+The workflow deliberately preserves `.env` on the VM and uses strict SSH host-key checking. Keep production application credentials only in `/opt/barsha-backend/.env`.
+
 ## Security notes
 
 - Keep `.env` out of Git; it is excluded by `.gitignore` and by `deploy.sh`.

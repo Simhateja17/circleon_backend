@@ -55,14 +55,22 @@ async function loadSendContext(service, job) {
   if (campaignError) throw campaignError;
   if (!campaign) throw new Error('Campaign not found');
 
-  return { account, campaign, message };
+  const { data: sequence, error: sequenceError } = await service
+    .from('email_sequences')
+    .select('attachments')
+    .eq('campaign_id', campaignId)
+    .eq('step_number', message.sequence_step)
+    .maybeSingle();
+  if (sequenceError) throw sequenceError;
+
+  return { account, campaign, message, sequence };
 }
 
 async function processSendJob(job) {
   const service = createServiceClient();
   if (!service) throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for email workers');
 
-  const { account, campaign, message } = await loadSendContext(service, job);
+  const { account, campaign, message, sequence } = await loadSendContext(service, job);
   const lead = message.leads;
   const isInboxReply = message.raw_payload?.kind === 'inbox_reply';
 
@@ -112,6 +120,21 @@ async function processSendJob(job) {
     ? textToHtml(withFooter)
     : appendTrackingPixel(textToHtml(withFooter), message.id);
 
+  const attachments = [];
+  if (!isInboxReply) {
+    for (const attachment of sequence?.attachments || []) {
+      const { data, error } = await service.storage
+        .from('campaign-attachments')
+        .download(attachment.storage_path);
+      if (error) throw error;
+      attachments.push({
+        filename: attachment.filename,
+        content: Buffer.from(await data.arrayBuffer()),
+        contentType: attachment.mime_type,
+      });
+    }
+  }
+
   const transport = createTransport(account);
   const sent = await sendEmail({
     transport,
@@ -123,6 +146,7 @@ async function processSendJob(job) {
     replyTo: account.reply_to_email || account.from_email,
     inReplyTo: isInboxReply ? message.in_reply_to_header : undefined,
     references: isInboxReply ? message.in_reply_to_header : undefined,
+    attachments,
   });
 
   const { error } = await service

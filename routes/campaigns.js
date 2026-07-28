@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('node:crypto');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = require('../lib/emailSequence');
@@ -23,13 +24,48 @@ function parseTime(value, fallbackHour) {
   };
 }
 
-function setTime(date, time) {
-  const next = new Date(date);
-  next.setHours(time.hour, time.minute, 0, 0);
-  return next;
+function isValidTimezone(timezone) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function zonedParts(date, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).reduce((result, part) => {
+    if (part.type !== 'literal') result[part.type] = part.value;
+    return result;
+  }, {});
+  const year = Number(parts.year);
+  const month = Number(parts.month);
+  const day = Number(parts.day);
+  return { year, month, day, hour: Number(parts.hour), minute: Number(parts.minute), weekday: new Date(Date.UTC(year, month - 1, day)).getUTCDay() };
+}
+
+function localDateTimeToUtc(parts, timezone) {
+  let candidate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute));
+  const target = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const actual = zonedParts(candidate, timezone);
+    const actualAsUtc = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+    candidate = new Date(candidate.getTime() + (target - actualAsUtc));
+  }
+  return candidate;
+}
+
+function nextLocalDate(parts) {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1));
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
 }
 
 function nextAllowedSendAt(from, campaign, sentPerDay) {
+  const timezone = campaign.timezone || 'Asia/Singapore';
   const activeDays = new Set(campaign.active_days || [1, 2, 3, 4, 5]);
   const dailyCap = Number(campaign.daily_send_cap || 100);
   const start = parseTime(campaign.sending_hours_start, 9);
@@ -37,18 +73,20 @@ function nextAllowedSendAt(from, campaign, sentPerDay) {
   let candidate = new Date(from);
 
   for (let guard = 0; guard < 370; guard += 1) {
-    const dayKey = candidate.toISOString().slice(0, 10);
-    const dayStart = setTime(candidate, start);
-    const dayEnd = setTime(candidate, end);
+    const local = zonedParts(candidate, timezone);
+    const dayKey = `${local.year}-${String(local.month).padStart(2, '0')}-${String(local.day).padStart(2, '0')}`;
+    const localDay = { year: local.year, month: local.month, day: local.day };
+    const dayStart = localDateTimeToUtc({ ...localDay, ...start }, timezone);
+    const dayEnd = localDateTimeToUtc({ ...localDay, ...end }, timezone);
 
-    if (!activeDays.has(candidate.getDay()) || (sentPerDay.get(dayKey) || 0) >= dailyCap) {
-      candidate = setTime(new Date(candidate.getFullYear(), candidate.getMonth(), candidate.getDate() + 1), start);
+    if (!activeDays.has(local.weekday) || (sentPerDay.get(dayKey) || 0) >= dailyCap) {
+      candidate = localDateTimeToUtc({ ...nextLocalDate(localDay), ...start }, timezone);
       continue;
     }
 
     if (candidate < dayStart) return dayStart;
     if (candidate > dayEnd) {
-      candidate = setTime(new Date(candidate.getFullYear(), candidate.getMonth(), candidate.getDate() + 1), start);
+      candidate = localDateTimeToUtc({ ...nextLocalDate(localDay), ...start }, timezone);
       continue;
     }
 
@@ -65,7 +103,8 @@ function buildSendJobs({ messages, campaign, workspaceId, now = new Date() }) {
 
   return messages.map(message => {
     const scheduledAt = nextAllowedSendAt(cursor, campaign, sentPerDay);
-    const dayKey = scheduledAt.toISOString().slice(0, 10);
+    const local = zonedParts(scheduledAt, campaign.timezone || 'Asia/Singapore');
+    const dayKey = `${local.year}-${String(local.month).padStart(2, '0')}-${String(local.day).padStart(2, '0')}`;
     sentPerDay.set(dayKey, (sentPerDay.get(dayKey) || 0) + 1);
     cursor = new Date(scheduledAt.getTime() + intervalMs);
 
@@ -99,6 +138,7 @@ const campaignSchema = z.object({
   import_run_id: z.string().uuid().nullable().optional(),
   sending_hours_start: z.string().regex(/^\d{2}:\d{2}$/).default('09:00'),
   sending_hours_end: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
+  timezone: z.string().trim().min(1).max(100).default('Asia/Singapore').refine(isValidTimezone, 'Invalid IANA timezone'),
   active_days: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([1, 2, 3, 4, 5]),
   daily_send_cap: z.number().int().min(1).max(500).default(100),
   cadence_per_hour: z.number().int().min(1).max(100).default(25),
@@ -153,6 +193,13 @@ const messageEditSchema = z.object({
 
 const approvalSchema = z.object({
   message_ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+const attachmentSchema = z.object({
+  filename: z.string().trim().min(1).max(180),
+  mime_type: z.enum(['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/quicktime']),
+  size_bytes: z.number().int().positive().max(10 * 1024 * 1024),
+  content_base64: z.string().min(1),
 });
 
 async function createDefaultSequence(req, campaignId) {
@@ -476,6 +523,64 @@ router.put('/:campaignId/sequences', async (req, res) => {
     return res.json({ campaign: await loadCampaign(req, workspace.id, campaign.id), removed_steps: removedNumbers });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to update campaign sequence' });
+  }
+});
+
+router.post('/:campaignId/sequences/:stepNumber/attachment', async (req, res) => {
+  try {
+    const parsed = attachmentSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid attachment', details: parsed.error.flatten() });
+
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (!['draft', 'paused'].includes(campaign.status)) {
+      return res.status(400).json({ error: 'Pause the campaign before changing attachments' });
+    }
+
+    const stepNumber = Number(req.params.stepNumber);
+    const sequence = (campaign.email_sequences || []).find(step => Number(step.step_number) === stepNumber);
+    if (!sequence) return res.status(404).json({ error: 'Sequence step not found' });
+
+    const buffer = Buffer.from(parsed.data.content_base64, 'base64');
+    if (buffer.length !== parsed.data.size_bytes) return res.status(400).json({ error: 'Attachment size could not be verified' });
+    const existing = Array.isArray(sequence.attachments) ? sequence.attachments : [];
+    const existingBytes = existing.reduce((sum, item) => sum + Number(item.size_bytes || 0), 0);
+    if (existingBytes + buffer.length > 20 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Attachments for one email cannot exceed 20 MB' });
+    }
+
+    const safeName = parsed.data.filename.replace(/[^a-zA-Z0-9._-]+/g, '-');
+    const storagePath = `${campaign.id}/${stepNumber}/${crypto.randomUUID()}-${safeName}`;
+    const service = createServiceClient();
+    if (!service) return res.status(500).json({ error: 'Storage service is not configured' });
+    const { error: uploadError } = await service.storage.from('campaign-attachments').upload(storagePath, buffer, {
+      contentType: parsed.data.mime_type,
+      cacheControl: '3600',
+      upsert: false,
+    });
+    if (uploadError) throw uploadError;
+
+    for (const old of existing) {
+      if (old.storage_path) await service.storage.from('campaign-attachments').remove([old.storage_path]);
+    }
+    const attachment = {
+      filename: parsed.data.filename,
+      mime_type: parsed.data.mime_type,
+      size_bytes: buffer.length,
+      storage_path: storagePath,
+    };
+    const { data: updated, error: updateError } = await req.supabase
+      .from('email_sequences')
+      .update({ attachments: [attachment] })
+      .eq('campaign_id', campaign.id)
+      .eq('step_number', stepNumber)
+      .select('*')
+      .single();
+    if (updateError) throw updateError;
+    return res.json({ sequence: updated, attachment });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to upload attachment' });
   }
 });
 

@@ -37,7 +37,8 @@ app.use('/api/retell/webhook', express.raw({ type: 'application/json', limit: '1
 // Stripe must receive the untouched payload for signature verification. Keep this
 // route before express.json(), just like the Retell signed webhook above.
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json', limit: '1mb' }), stripeWebhookHandler);
-app.use(express.json({ limit: '10mb' }));
+// A 10 MB binary attachment expands when sent as base64 JSON.
+app.use(express.json({ limit: '20mb' }));
 
 app.use('/api/auth', authRoutes);
 app.use('/api/workspace', workspaceRoutes);
