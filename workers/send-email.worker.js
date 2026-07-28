@@ -64,13 +64,14 @@ async function processSendJob(job) {
 
   const { account, campaign, message } = await loadSendContext(service, job);
   const lead = message.leads;
+  const isInboxReply = message.raw_payload?.kind === 'inbox_reply';
 
   const billing = await getBilling(service, campaign.workspace_id);
   if (!isActiveSubscription(billing)) {
     return { skipped: true, reason: 'Subscription is not active' };
   }
 
-  if (campaign.status !== 'active') {
+  if (!isInboxReply && campaign.status !== 'active') {
     return { skipped: true, reason: 'Campaign is not active' };
   }
 
@@ -92,7 +93,7 @@ async function processSendJob(job) {
     .limit(1);
 
   if (inboundError) throw inboundError;
-  if (inboundReplies?.length) {
+  if (!isInboxReply && inboundReplies?.length) {
     return { skipped: true, reason: 'Lead already replied' };
   }
 
@@ -104,12 +105,12 @@ async function processSendJob(job) {
   if (!baseUrl) throw new Error('APP_PUBLIC_URL or API_PUBLIC_URL is required');
 
   const unsubscribeUrl = `${baseUrl.replace(/\/$/, '')}/api/emails/unsubscribe/${encodeURIComponent(lead.id)}`;
-  const withFooter = appendUnsubscribeFooter(
-    message.body,
-    unsubscribeUrl,
-    account.from_email
-  );
-  const html = appendTrackingPixel(textToHtml(withFooter), message.id);
+  const withFooter = isInboxReply
+    ? message.body
+    : appendUnsubscribeFooter(message.body, unsubscribeUrl, account.from_email);
+  const html = isInboxReply
+    ? textToHtml(withFooter)
+    : appendTrackingPixel(textToHtml(withFooter), message.id);
 
   const transport = createTransport(account);
   const sent = await sendEmail({
@@ -120,6 +121,8 @@ async function processSendJob(job) {
     body: withFooter,
     html,
     replyTo: account.reply_to_email || account.from_email,
+    inReplyTo: isInboxReply ? message.in_reply_to_header : undefined,
+    references: isInboxReply ? message.in_reply_to_header : undefined,
   });
 
   const { error } = await service

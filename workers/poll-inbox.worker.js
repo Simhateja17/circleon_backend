@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { classifyIntent, draftReply } = require('../lib/gemini');
-const { fetchUnseenMessages } = require('../lib/imap');
+const { fetchMessagesSince } = require('../lib/imap');
 const { createServiceClient } = require('../lib/supabase');
 
 function normalizeHeader(value) {
@@ -51,27 +51,6 @@ async function processInboundMessage(service, account, item, agentConfig) {
     return { matched: false };
   }
 
-  const { data: lead, error: leadError } = await service
-    .from('leads')
-    .select('*')
-    .eq('id', original.lead_id)
-    .maybeSingle();
-
-  if (leadError) throw leadError;
-  if (!lead) return { matched: false };
-
-  const intent = await classifyIntent({ inboundMessage: parsed });
-  const isDnc = intent === 'dnc_request' || /\b(unsubscribe|stop|remove me|opt out)\b/i.test(parsed.body);
-  const history = await getConversationHistory(service, account.workspace_id, lead.id);
-  const replyDraft = isDnc
-    ? ''
-    : await draftReply({
-        lead,
-        inboundMessage: parsed,
-        conversationHistory: history,
-        agentConfig,
-      });
-
   if (parsed.message_id_header) {
     const { data: duplicate, error: duplicateError } = await service
       .from('messages')
@@ -82,6 +61,45 @@ async function processInboundMessage(service, account, item, agentConfig) {
 
     if (duplicateError) throw duplicateError;
     if (duplicate) return { matched: true, duplicate: true };
+  }
+
+  const { data: lead, error: leadError } = await service
+    .from('leads')
+    .select('*')
+    .eq('id', original.lead_id)
+    .maybeSingle();
+
+  if (leadError) throw leadError;
+  if (!lead) return { matched: false };
+
+  let intent = null;
+  try {
+    intent = await classifyIntent({ inboundMessage: parsed });
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'inbox_intent_classification_failed',
+      workspaceId: account.workspace_id,
+      error: error.message,
+    }));
+  }
+  const isDnc = intent === 'dnc_request' || /\b(unsubscribe|stop|remove me|opt out)\b/i.test(parsed.body);
+  const history = await getConversationHistory(service, account.workspace_id, lead.id);
+  let replyDraft = '';
+  if (!isDnc && agentConfig) {
+    try {
+      replyDraft = await draftReply({
+        lead,
+        inboundMessage: parsed,
+        conversationHistory: history,
+        agentConfig,
+      });
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'inbox_reply_draft_failed',
+        workspaceId: account.workspace_id,
+        error: error.message,
+      }));
+    }
   }
 
   const { data: inbound, error: insertError } = await service
@@ -96,7 +114,7 @@ async function processInboundMessage(service, account, item, agentConfig) {
       draft_body: replyDraft || null,
       message_id_header: parsed.message_id_header || null,
       in_reply_to_header: parsed.in_reply_to_header || null,
-      status: isDnc ? 'received' : 'pending_approval',
+      status: replyDraft ? 'pending_approval' : 'received',
       intent_classification: intent,
       raw_payload: {
         uid: item.uid,
@@ -153,9 +171,11 @@ async function pollWorkspaceInbox(service, account) {
     .maybeSingle();
 
   if (agentError) throw agentError;
-  if (!agentConfig) return { processed: 0, matched: 0 };
-
-  const messages = await fetchUnseenMessages(account);
+  const initialLookbackMs = 7 * 24 * 60 * 60 * 1000;
+  const lastPolledAt = account.inbox_last_polled_at
+    ? new Date(account.inbox_last_polled_at)
+    : new Date(Date.now() - initialLookbackMs);
+  const messages = await fetchMessagesSince(account, lastPolledAt);
   let matched = 0;
 
   for (const item of messages) {
@@ -163,7 +183,14 @@ async function pollWorkspaceInbox(service, account) {
     if (result.matched) matched += 1;
   }
 
-  return { processed: messages.length, matched };
+  const polledAt = new Date().toISOString();
+  const { error: pollUpdateError } = await service
+    .from('connected_accounts')
+    .update({ inbox_last_polled_at: polledAt })
+    .eq('id', account.id);
+  if (pollUpdateError) throw pollUpdateError;
+
+  return { processed: messages.length, matched, polledAt };
 }
 
 async function pollAllInboxes() {
