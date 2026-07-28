@@ -6,6 +6,7 @@ const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = r
 const { createQueueJobId, getCampaignGenerationQueue, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const { requireActiveSubscription } = require('../lib/billing');
+const { createServiceClient } = require('../lib/supabase');
 
 const router = express.Router();
 
