@@ -2,6 +2,7 @@ const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const { enqueueAgentLaunchJob } = require('../lib/agentLaunch');
+const { requireActiveSubscription } = require('../lib/billing');
 
 const router = express.Router();
 
@@ -10,6 +11,8 @@ router.use(requireAuth);
 router.post('/agent-launch', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+
+    if (!await requireActiveSubscription(req, res, workspace)) return;
 
     if (!workspace.onboarding_completed) {
       return res.status(400).json({ error: 'Complete onboarding before launching the agent' });

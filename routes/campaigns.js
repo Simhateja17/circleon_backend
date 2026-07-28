@@ -4,6 +4,7 @@ const requireAuth = require('../middleware/auth');
 const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = require('../lib/emailSequence');
 const { createQueueJobId, getCampaignGenerationQueue, getEmailSendQueue } = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
+const { requireActiveSubscription } = require('../lib/billing');
 
 const router = express.Router();
 
@@ -789,6 +790,8 @@ router.post('/:campaignId/messages/:messageId/send-now', async (req, res) => {
 router.post('/:campaignId/launch', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+
+    if (!await requireActiveSubscription(req, res, workspace)) return;
 
     const { data: account, error: accountError } = await req.supabase
       .from('connected_accounts')

@@ -6,6 +6,7 @@ const {
   normalizePhone,
 } = require('../lib/calling');
 const { enqueueAgentLaunchJob } = require('../lib/agentLaunch');
+const { requireActiveSubscription } = require('../lib/billing');
 
 const router = express.Router();
 
@@ -150,6 +151,8 @@ router.post('/provision-agent', async (req, res) => {
     const bundle = await getWorkspaceBundle(req.supabase, req.user);
     const { workspace, agentConfig } = bundle;
 
+    if (!await requireActiveSubscription(req, res, workspace)) return;
+
     if (!bundle.workspace?.onboarding_completed) {
       return res.status(400).json({ error: 'Complete onboarding before launching the agent' });
     }
@@ -177,6 +180,8 @@ router.post('/launch', async (req, res) => {
     const bundle = await getWorkspaceBundle(req.supabase, req.user);
     const state = readiness(bundle);
     const enable = req.body.enabled !== false;
+
+    if (enable && !await requireActiveSubscription(req, res, bundle.workspace)) return;
 
     if (enable && !state.ready) {
       return res.status(400).json({

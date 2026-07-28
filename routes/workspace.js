@@ -1,6 +1,7 @@
 const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { suggestTargetTerms } = require('../lib/gemini');
+const { getBilling, isActiveSubscription, requireActiveSubscription } = require('../lib/billing');
 
 const router = express.Router();
 
@@ -86,6 +87,7 @@ router.get('/me', async (req, res) => {
 
     if (error) throw error;
 
+    const billing = await getBilling(req.supabase, workspace.id);
     return res.json({
       user: {
         id: req.user.id,
@@ -93,6 +95,8 @@ router.get('/me', async (req, res) => {
       },
       workspace,
       agentConfig,
+      billing,
+      subscriptionActive: isActiveSubscription(billing),
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load workspace' });
@@ -202,6 +206,7 @@ router.post('/onboarding', async (req, res) => {
     const answers = req.body.answers || {};
     const companyName = String(getAnswer(answers, 'company', 'My Workspace')).trim();
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    if (!await requireActiveSubscription(req, res, workspace)) return;
     const systemPrompt = generateSystemPrompt(answers);
 
     const { data: updatedWorkspace, error: workspaceError } = await req.supabase

@@ -12,6 +12,7 @@ const callingRoutes = require('./routes/calling');
 const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
+const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
@@ -33,6 +34,9 @@ app.use((req, res, next) => {
   return res.status(403).json({ error: 'Invalid request origin' });
 });
 app.use('/api/retell/webhook', express.raw({ type: 'application/json', limit: '1mb' }), retellWebhookRoutes);
+// Stripe must receive the untouched payload for signature verification. Keep this
+// route before express.json(), just like the Retell signed webhook above.
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json', limit: '1mb' }), stripeWebhookHandler);
 app.use(express.json({ limit: '10mb' }));
 
 app.use('/api/auth', authRoutes);
@@ -45,6 +49,7 @@ app.use('/api/inbox', inboxRoutes);
 app.use('/api/calling', callingRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
+app.use('/api/billing', billingRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });

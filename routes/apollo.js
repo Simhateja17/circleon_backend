@@ -2,6 +2,7 @@ const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { createServiceClient } = require('../lib/supabase');
 const { getOrCreateWorkspace } = require('../lib/workspace');
+const { requireActiveSubscription } = require('../lib/billing');
 const { createQueueJobId, getLeadImportQueue } = require('../lib/redis');
 const { findExistingLead, normalizeLead, upsertLeadWithContext, usableEmail } = require('./leads');
 const {
@@ -722,6 +723,7 @@ router.post('/import', async (req, res) => {
   let pendingRun = null;
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    if (!await requireActiveSubscription(req, res, workspace)) return;
     const agentConfig = await getAgentConfig(req.supabase, workspace.id);
     const filters = normalizeFilters(req.body.filters || req.body, agentConfig || {});
     debug('import_start', {

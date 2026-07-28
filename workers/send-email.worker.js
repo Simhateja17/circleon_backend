@@ -3,6 +3,7 @@ require('dotenv').config();
 const { Worker } = require('bullmq');
 const { createServiceClient } = require('../lib/supabase');
 const { getRedisConnection } = require('../lib/redis');
+const { getBilling, isActiveSubscription } = require('../lib/billing');
 const {
   appendTrackingPixel,
   appendUnsubscribeFooter,
@@ -63,6 +64,11 @@ async function processSendJob(job) {
 
   const { account, campaign, message } = await loadSendContext(service, job);
   const lead = message.leads;
+
+  const billing = await getBilling(service, campaign.workspace_id);
+  if (!isActiveSubscription(billing)) {
+    return { skipped: true, reason: 'Subscription is not active' };
+  }
 
   if (campaign.status !== 'active') {
     return { skipped: true, reason: 'Campaign is not active' };
