@@ -37,13 +37,31 @@ async function getMessage(supabase, workspaceId, messageId) {
 async function getConversationHistory(supabase, workspaceId, leadId) {
   const { data, error } = await supabase
     .from('messages')
-    .select('id, direction, subject, body, draft_body, status, created_at')
+    .select('*, campaigns(name)')
     .eq('workspace_id', workspaceId)
     .eq('lead_id', leadId)
+    .in('status', ['sent', 'auto_sent', 'received', 'pending_approval'])
     .order('created_at', { ascending: true });
 
   if (error) throw error;
   return data || [];
+}
+
+function messageTime(message) {
+  return new Date(message.sent_at || message.received_at || message.created_at || 0).getTime();
+}
+
+function conversationStatus(messages, lead) {
+  const inbound = messages.filter(message => message.direction === 'inbound');
+  const latestInbound = [...inbound].sort((a, b) => messageTime(b) - messageTime(a))[0];
+  const hasDraft = inbound.some(message => message.status === 'pending_approval' && !message.responded_at);
+  const needsReply = inbound.some(message => ['received', 'pending_approval'].includes(message.status) && !message.responded_at);
+
+  if (lead?.dnc_status === 'blocked' || inbound.some(message => message.intent_classification === 'dnc_request')) return 'unsubscribed';
+  if (hasDraft) return 'draft_ready';
+  if (needsReply) return 'needs_reply';
+  if (latestInbound?.intent_classification === 'positive') return 'positive';
+  return 'sent';
 }
 
 router.use(requireAuth);
@@ -64,6 +82,56 @@ router.get('/', async (req, res) => {
     return res.json({ conversations: data || [] });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load inbox' });
+  }
+});
+
+router.get('/conversations', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data, error } = await req.supabase
+      .from('messages')
+      .select('*, leads(id, full_name, company_name, title, email, dnc_status), campaigns(name)')
+      .eq('workspace_id', workspace.id)
+      .not('lead_id', 'is', null)
+      .in('direction', ['inbound', 'outbound'])
+      .in('status', ['sent', 'auto_sent', 'received', 'pending_approval'])
+      .order('created_at', { ascending: false })
+      .limit(1000);
+    if (error) throw error;
+
+    const grouped = new Map();
+    for (const message of data || []) {
+      if (!message.lead_id || !message.leads) continue;
+      const current = grouped.get(message.lead_id) || { lead: message.leads, messages: [] };
+      current.messages.push(message);
+      grouped.set(message.lead_id, current);
+    }
+
+    const conversations = [...grouped.entries()].map(([leadId, group]) => {
+      const messages = [...group.messages].sort((a, b) => messageTime(b) - messageTime(a));
+      const latest = messages[0];
+      const inbound = messages.filter(message => message.direction === 'inbound');
+      const latestInbound = [...inbound].sort((a, b) => messageTime(b) - messageTime(a))[0] || null;
+      const status = conversationStatus(messages, group.lead);
+      return {
+        lead_id: leadId,
+        lead: group.lead,
+        latest_message: latest,
+        latest_inbound_message_id: latestInbound?.id || null,
+        campaign_name: latest.campaigns?.name || null,
+        message_count: messages.length,
+        last_message_at: latest.sent_at || latest.received_at || latest.created_at,
+        status,
+        needs_reply: status === 'needs_reply' || status === 'draft_ready',
+        draft_ready: status === 'draft_ready',
+        positive_intent: latestInbound?.intent_classification === 'positive',
+        unsubscribed: status === 'unsubscribed',
+      };
+    }).sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
+
+    return res.json({ conversations });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load conversations' });
   }
 });
 
