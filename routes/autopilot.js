@@ -17,7 +17,7 @@ const settingsSchema = z.object({
   include_all_launched_campaigns: z.boolean(),
   campaign_ids: z.array(z.string().uuid()).max(1000),
   timezone: z.string().min(1).max(100).refine(validTimezone, 'Invalid timezone'),
-  daily_run_time: z.string().regex(/^\d{2}:\d{2}$/),
+  daily_run_time: z.string().regex(/^\d{2}:\d{2}(?::\d{2})?$/).transform(value => value.slice(0, 5)),
   workspace_daily_send_cap: z.number().int().min(1).max(2000),
 });
 
