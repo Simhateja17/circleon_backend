@@ -223,6 +223,44 @@ router.post('/conversations/:leadId/reply', async (req, res) => {
   }
 });
 
+router.post('/conversations/:leadId/draft', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data: lead, error: leadError } = await req.supabase
+      .from('leads')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('id', req.params.leadId)
+      .maybeSingle();
+    if (leadError) throw leadError;
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+    const [agentConfig, history] = await Promise.all([
+      getAgentConfig(req.supabase, workspace.id),
+      getConversationHistory(req.supabase, workspace.id, lead.id),
+    ]);
+    if (!agentConfig) return res.status(400).json({ error: 'Agent configuration is required before drafting replies' });
+
+    const latestInbound = [...history].reverse().find(message => message.direction === 'inbound');
+    if (!latestInbound) return res.status(400).json({ error: 'Barsha needs an inbound email before it can draft a reply' });
+
+    const body = await draftReply({
+      lead,
+      inboundMessage: {
+        subject: latestInbound.subject,
+        body: latestInbound.body,
+        intent: latestInbound.intent_classification,
+      },
+      conversationHistory: history,
+      agentConfig,
+    });
+
+    return res.json({ body });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to draft a reply' });
+  }
+});
+
 router.get('/:leadId', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
