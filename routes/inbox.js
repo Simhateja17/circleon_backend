@@ -44,7 +44,10 @@ async function getConversationHistory(supabase, workspaceId, leadId) {
     .select('*, campaigns(name)')
     .eq('workspace_id', workspaceId)
     .eq('lead_id', leadId)
-    .in('status', ['sent', 'auto_sent', 'received', 'pending_approval'])
+    // Include approved outbound replies immediately after they are queued. The
+    // SMTP worker may mark them sent a moment later, but the conversation UI
+    // should not require a page refresh to show the user's reply.
+    .in('status', ['approved', 'sent', 'auto_sent', 'received', 'pending_approval'])
     .order('created_at', { ascending: true });
 
   if (error) throw error;
