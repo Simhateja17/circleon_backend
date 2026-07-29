@@ -32,6 +32,7 @@ async function processImportJob(job) {
       rows: job.data.rows,
       mappings: job.data.mappings,
       mode: job.data.mode,
+      campaignId: job.data.campaignId || null,
     });
   }
 

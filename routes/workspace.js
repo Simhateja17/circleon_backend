@@ -2,6 +2,7 @@ const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { suggestTargetTerms } = require('../lib/gemini');
 const { getBilling, isActiveSubscription, requireActiveSubscription } = require('../lib/billing');
+const { ensureSuggestedCampaigns } = require('../lib/autopilot');
 
 const router = express.Router();
 
@@ -252,6 +253,12 @@ router.post('/onboarding', async (req, res) => {
       .single();
 
     if (agentError) throw agentError;
+
+    // Create reviewable campaign drafts only after onboarding completes. This
+    // is idempotent and never launches a campaign or sends an email.
+    await ensureSuggestedCampaigns(req.supabase, workspace.id, agentConfig).catch(error => {
+      console.error('[autopilot] failed to create onboarding campaign suggestions', error.message);
+    });
 
     return res.json({
       workspace: updatedWorkspace,

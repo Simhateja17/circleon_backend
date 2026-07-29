@@ -12,11 +12,14 @@ const callingRoutes = require('./routes/calling');
 const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
+const autopilotRoutes = require('./routes/autopilot');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
 const { createWorker: createLeadImportWorker } = require('./workers/lead-import.worker');
+const { createWorker: createAutopilotWorker } = require('./workers/autopilot.worker');
+const { startAutopilotScheduler } = require('./lib/autopilotScheduler');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -50,6 +53,7 @@ app.use('/api/inbox', inboxRoutes);
 app.use('/api/calling', callingRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
+app.use('/api/autopilot', autopilotRoutes);
 app.use('/api/billing', billingRoutes);
 
 app.get('/api/health', (_req, res) => {
@@ -72,7 +76,18 @@ app.listen(PORT, () => {
   } else {
     console.log('[lead-import-worker] in-process worker disabled');
   }
+  const runAutopilotWorkerInProcess = process.env.AUTOPILOT_WORKER_ENABLED === 'true'
+    || (process.env.AUTOPILOT_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
+  if (runAutopilotWorkerInProcess) {
+    try {
+      createAutopilotWorker();
+      console.log('[autopilot-worker] running in this process');
+    } catch (error) {
+      console.error('[autopilot-worker] failed to start', error.message);
+    }
+  }
   startCallingQueue();
+  startAutopilotScheduler();
   resumeQueuedAgentLaunchJobs().catch(error => {
     console.error('[agent-launch-recovery] failed', error);
   });

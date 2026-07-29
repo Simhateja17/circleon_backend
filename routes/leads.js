@@ -277,6 +277,21 @@ async function upsertLeadWithContext(supabase, user, workspace, input, importRun
   return { skipped: false, updated: Boolean(existing), lead: savedLead };
 }
 
+async function assignLeadToCampaign(supabase, workspaceId, leadId, campaignId, selectedBy = null) {
+  if (!campaignId) return;
+  const [{ data: campaign, error: campaignError }, { data: existing, error: existingError }] = await Promise.all([
+    supabase.from('campaigns').select('id').eq('workspace_id', workspaceId).eq('id', campaignId).maybeSingle(),
+    supabase.from('campaign_leads').select('campaign_id').eq('workspace_id', workspaceId).eq('lead_id', leadId).maybeSingle(),
+  ]);
+  if (campaignError || existingError) throw campaignError || existingError;
+  if (!campaign) throw new Error('Selected campaign was not found');
+  if (existing && existing.campaign_id !== campaignId) throw new Error('This lead is already assigned to another campaign');
+  const { error } = await supabase.from('campaign_leads').upsert({ campaign_id: campaignId, lead_id: leadId, workspace_id: workspaceId, selected_by: selectedBy }, { onConflict: 'campaign_id,lead_id' });
+  if (error) throw error;
+  const { error: leadError } = await supabase.from('leads').update({ campaign_id: campaignId, lifecycle_status: 'selected_for_campaign' }).eq('id', leadId);
+  if (leadError) throw leadError;
+}
+
 router.use(requireAuth);
 
 router.get('/', async (req, res) => {
@@ -314,11 +329,14 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
-    const result = await upsertLeadWithContext(req.supabase, req.user, workspace, req.body.lead || req.body, null, 'manual');
+    const input = req.body.lead || req.body;
+    const result = await upsertLeadWithContext(req.supabase, req.user, workspace, input, null, 'manual');
 
     if (result.skipped) {
       return res.status(400).json({ error: result.reason });
     }
+
+    await assignLeadToCampaign(req.supabase, workspace.id, result.lead.id, input.campaign_id, req.user.id);
 
     return res.json({ lead: result.lead, updated: result.updated });
   } catch (error) {
@@ -412,7 +430,7 @@ router.post('/csv/preview', async (req, res) => {
   }
 });
 
-async function processCsvImport({ supabase, user, workspace, run, rows, mappings, mode }) {
+async function processCsvImport({ supabase, user, workspace, run, rows, mappings, mode, campaignId = null }) {
   let created = 0;
   let updated = 0;
   let skipped = 0;
@@ -476,6 +494,7 @@ async function processCsvImport({ supabase, user, workspace, run, rows, mappings
         rejected.push({ row: index + 2, reason: result.reason });
       } else if (result.updated) updated += 1;
       else created += 1;
+      if (!result.skipped && campaignId) await assignLeadToCampaign(supabase, workspace.id, result.lead.id, campaignId, user.id);
     }
 
     await supabase.from('lead_import_runs').update({
@@ -509,7 +528,7 @@ router.post('/csv/import', async (req, res) => {
       source: 'csv',
       status: 'pending',
       total_rows: parsed.rows.length,
-      raw_meta: { mode, columns: parsed.headers, mappings },
+      raw_meta: { mode, columns: parsed.headers, mappings, campaign_id: req.body.campaign_id || null },
     }).select('*').single();
     if (error) throw error;
     run = data;
@@ -522,6 +541,7 @@ router.post('/csv/import', async (req, res) => {
       rows: parsed.rows,
       mappings,
       mode,
+      campaignId: req.body.campaign_id || null,
     }, { jobId: createQueueJobId('csv', run.id) });
     return res.status(202).json({ importRun: run });
   } catch (error) {
@@ -627,3 +647,4 @@ module.exports.calculateFitScore = calculateFitScore;
 module.exports.normalizeDomain = normalizeDomain;
 module.exports.usableEmail = usableEmail;
 module.exports.processCsvImport = processCsvImport;
+module.exports.assignLeadToCampaign = assignLeadToCampaign;

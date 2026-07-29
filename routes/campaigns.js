@@ -7,6 +7,7 @@ const { createQueueJobId, getCampaignGenerationQueue, getEmailSendQueue } = requ
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const { requireActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
+const { scheduleMessages } = require('../lib/campaignScheduling');
 
 const router = express.Router();
 
@@ -185,6 +186,10 @@ const sequenceSchema = z.object({
 
 const sendNowSchema = z.object({
   message_ids: z.array(z.string().uuid()).min(1).max(500),
+});
+
+const rescheduleSchema = z.object({
+  scheduled_at: z.string().datetime(),
 });
 
 const messageEditSchema = z.object({
@@ -840,6 +845,35 @@ router.patch('/:campaignId/messages/:messageId', async (req, res) => {
   }
 });
 
+router.patch('/:campaignId/messages/:messageId/schedule', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const parsed = rescheduleSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Provide a valid future scheduled date and time' });
+    const requestedAt = new Date(parsed.data.scheduled_at);
+    if (requestedAt <= new Date()) return res.status(400).json({ error: 'Scheduled time must be in the future' });
+    const [campaign, messageResult] = await Promise.all([
+      loadCampaign(req, workspace.id, req.params.campaignId),
+      req.supabase.from('messages').select('id, lead_id, sequence_step, status, direction').eq('workspace_id', workspace.id).eq('campaign_id', req.params.campaignId).eq('id', req.params.messageId).maybeSingle(),
+    ]);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+    if (campaign.status !== 'active') return res.status(400).json({ error: 'Launch the campaign before rescheduling emails' });
+    if (messageResult.error) throw messageResult.error;
+    const message = messageResult.data;
+    if (!message || message.direction !== 'outbound' || !['draft', 'approved'].includes(message.status)) return res.status(400).json({ error: 'Only queued draft emails can be rescheduled' });
+    const queue = getEmailSendQueue();
+    const previous = await queue.getJob(createQueueJobId('send', message.id));
+    if (previous) await previous.remove();
+    await req.supabase.from('messages').update({ scheduled_at: null, schedule_reason: null }).eq('id', message.id);
+    await scheduleMessages({ supabase: req.supabase, queue, workspaceId: workspace.id, campaign, messages: [message], now: requestedAt, reason: 'Manually rescheduled' });
+    const { data: updated, error: updatedError } = await req.supabase.from('messages').select('*').eq('id', message.id).single();
+    if (updatedError) throw updatedError;
+    return res.json({ message: updated });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to reschedule email' });
+  }
+});
+
 router.post('/:campaignId/messages/:messageId/regenerate', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
@@ -934,16 +968,15 @@ router.post('/:campaignId/launch', async (req, res) => {
       .eq('status', 'approved');
 
     if (messageError) throw messageError;
-    if (!messages?.length) {
-      return res.status(400).json({ error: 'Approve at least one generated email before launching' });
-    }
-
     const now = new Date().toISOString();
     const { data: updatedCampaign, error: updateCampaignError } = await req.supabase
       .from('campaigns')
       .update({
         status: 'active',
         launched_at: campaign.launched_at || now,
+        attention_required: false,
+        attention_reason: null,
+        autopilot_confirmed_at: campaign.autopilot_confirmed_at || now,
       })
       .eq('id', campaign.id)
       .select('*')
@@ -952,16 +985,21 @@ router.post('/:campaignId/launch', async (req, res) => {
     if (updateCampaignError) throw updateCampaignError;
 
     const queue = getEmailSendQueue();
-    await queue.addBulk(buildSendJobs({
-      messages,
-      campaign: updatedCampaign,
-      workspaceId: workspace.id,
-      now: new Date(now),
-    }));
+    if (messages?.length) {
+      await scheduleMessages({
+        supabase: req.supabase,
+        queue,
+        messages,
+        campaign: updatedCampaign,
+        workspaceId: workspace.id,
+        now: new Date(now),
+        reason: 'Campaign launch',
+      });
+    }
 
     return res.json({
       campaign: updatedCampaign,
-      queued: messages.length,
+      queued: messages?.length || 0,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to launch campaign' });

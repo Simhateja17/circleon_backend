@@ -4,6 +4,9 @@ const { Worker } = require('bullmq');
 const { createServiceClient } = require('../lib/supabase');
 const { getRedisConnection } = require('../lib/redis');
 const { getBilling, isActiveSubscription } = require('../lib/billing');
+const { getAutopilotSettings, isCampaignIncluded } = require('../lib/autopilot');
+const { scheduleMessages } = require('../lib/campaignScheduling');
+const { getEmailSendQueue } = require('../lib/redis');
 const {
   appendTrackingPixel,
   appendUnsubscribeFooter,
@@ -81,6 +84,13 @@ async function processSendJob(job) {
 
   if (!isInboxReply && campaign.status !== 'active') {
     return { skipped: true, reason: 'Campaign is not active' };
+  }
+
+  if (!isInboxReply && campaign.autopilot_enabled) {
+    const settings = await getAutopilotSettings(service, campaign.workspace_id);
+    if (!settings.enabled || settings.paused_at || !isCampaignIncluded(settings, campaign)) {
+      return { skipped: true, reason: 'Autopilot is paused for this campaign' };
+    }
   }
 
   if (!lead?.email) {
@@ -163,6 +173,30 @@ async function processSendJob(job) {
     .eq('id', message.id);
 
   if (error) throw error;
+
+  // Autopilot sequences continue only after a successful send. The next step
+  // remains queued with its configured delay and is still stopped by replies,
+  // opt-outs, bounces, or a campaign/workspace pause when its job executes.
+  if (!isInboxReply && campaign.autopilot_enabled) {
+    const nextStep = Number(message.sequence_step || 0) + 1;
+    const [{ data: nextMessage, error: nextMessageError }, { data: nextSequence, error: nextSequenceError }] = await Promise.all([
+      service.from('messages').select('id, lead_id, sequence_step').eq('workspace_id', campaign.workspace_id).eq('campaign_id', campaign.id).eq('lead_id', message.lead_id).eq('direction', 'outbound').eq('sequence_step', nextStep).eq('status', 'draft').is('scheduled_at', null).maybeSingle(),
+      service.from('email_sequences').select('delay_days').eq('campaign_id', campaign.id).eq('step_number', nextStep).maybeSingle(),
+    ]);
+    if (nextMessageError || nextSequenceError) throw nextMessageError || nextSequenceError;
+    if (nextMessage && nextSequence) {
+      const due = new Date(Date.now() + Math.max(0, Number(nextSequence.delay_days || 0)) * 24 * 60 * 60 * 1000);
+      await scheduleMessages({
+        supabase: service,
+        queue: getEmailSendQueue(),
+        workspaceId: campaign.workspace_id,
+        campaign,
+        messages: [nextMessage],
+        now: due,
+        reason: `Autopilot sequence step ${nextStep}`,
+      });
+    }
+  }
 
   return {
     sent: true,

@@ -9,6 +9,7 @@
     "worker:send-email": "node workers/send-email.worker.js",
     "worker:poll-inbox": "node workers/poll-inbox.worker.js",
     "worker:lead-import": "node workers/lead-import.worker.js"
+    ,"worker:autopilot": "node workers/autopilot.worker.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
