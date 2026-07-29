@@ -58,13 +58,19 @@ async function loadSendContext(service, job) {
   if (campaignError) throw campaignError;
   if (!campaign) throw new Error('Campaign not found');
 
-  const { data: sequence, error: sequenceError } = await service
-    .from('email_sequences')
-    .select('attachments')
-    .eq('campaign_id', campaignId)
-    .eq('step_number', message.sequence_step)
-    .maybeSingle();
-  if (sequenceError) throw sequenceError;
+  let sequence = null;
+  // Direct replies are not campaign sequence steps, so sequence_step is null.
+  // Avoid sending `eq.null` to PostgREST for an integer column.
+  if (message.sequence_step !== null && message.sequence_step !== undefined) {
+    const { data, error: sequenceError } = await service
+      .from('email_sequences')
+      .select('attachments')
+      .eq('campaign_id', campaignId)
+      .eq('step_number', message.sequence_step)
+      .maybeSingle();
+    if (sequenceError) throw sequenceError;
+    sequence = data;
+  }
 
   return { account, campaign, message, sequence };
 }
@@ -75,7 +81,7 @@ async function processSendJob(job) {
 
   const { account, campaign, message, sequence } = await loadSendContext(service, job);
   const lead = message.leads;
-  const isInboxReply = message.raw_payload?.kind === 'inbox_reply';
+  const isInboxReply = ['inbox_reply', 'manual_reply'].includes(message.raw_payload?.kind);
 
   const billing = await getBilling(service, campaign.workspace_id);
   if (!isActiveSubscription(billing)) {

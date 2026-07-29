@@ -59,12 +59,21 @@ async function processAutopilotJob(job) {
   if (leadsError) throw leadsError;
   const leadIds = (readyLeads || []).map(lead => lead.id);
   if (leadIds.length) {
-    const { error: assignmentError } = await service.from('campaign_leads').upsert(leadIds.map(leadId => ({ campaign_id: campaignId, lead_id: leadId, workspace_id: workspaceId, selected_by: workspace.owner_id })), {
+    const { error: ownershipError } = await service.from('lead_campaign_ownership').upsert(leadIds.map(leadId => ({ workspace_id: workspaceId, lead_id: leadId, campaign_id: campaignId, source: 'autopilot' })), {
       onConflict: 'workspace_id,lead_id', ignoreDuplicates: true,
     });
+    if (ownershipError) throw ownershipError;
+    const { data: ownedLeads, error: ownedLeadsError } = await service.from('lead_campaign_ownership').select('lead_id')
+      .eq('workspace_id', workspaceId).eq('campaign_id', campaignId).in('lead_id', leadIds);
+    if (ownedLeadsError) throw ownedLeadsError;
+    const ownedLeadIds = (ownedLeads || []).map(lead => lead.lead_id);
+    const { error: assignmentError } = await service.from('campaign_leads').upsert(ownedLeadIds.map(leadId => ({ campaign_id: campaignId, lead_id: leadId, workspace_id: workspaceId, selected_by: workspace.owner_id })), {
+      onConflict: 'campaign_id,lead_id', ignoreDuplicates: true,
+    });
     if (assignmentError) throw assignmentError;
-    const { error: leadUpdateError } = await service.from('leads').update({ campaign_id: campaignId, lifecycle_status: 'selected_for_campaign' }).eq('workspace_id', workspaceId).in('id', leadIds);
+    const { error: leadUpdateError } = await service.from('leads').update({ campaign_id: campaignId, lifecycle_status: 'selected_for_campaign' }).eq('workspace_id', workspaceId).in('id', ownedLeadIds);
     if (leadUpdateError) throw leadUpdateError;
+    leadIds.splice(0, leadIds.length, ...ownedLeadIds);
   }
 
   let generation = { generated: 0, failed: 0 };

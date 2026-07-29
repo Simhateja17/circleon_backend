@@ -47,10 +47,17 @@ create table if not exists public.autopilot_runs (
   unique (workspace_id, campaign_id, local_run_date)
 );
 
--- A lead belongs to one campaign at a time. Existing duplicate assignments must
--- be resolved before this migration is applied in a database that contains them.
-create unique index if not exists campaign_leads_workspace_lead_unique
-on public.campaign_leads(workspace_id, lead_id);
+-- Preserve historical campaign_leads rows, which may legitimately contain old
+-- multi-campaign assignments, while enforcing one owner for every new manual,
+-- CSV, and autopilot assignment from this point onward.
+create table if not exists public.lead_campaign_ownership (
+  workspace_id uuid not null references public.workspaces(id) on delete cascade,
+  lead_id uuid not null references public.leads(id) on delete cascade,
+  campaign_id uuid not null references public.campaigns(id) on delete cascade,
+  source text not null default 'manual' check (source in ('manual', 'csv', 'autopilot')),
+  assigned_at timestamptz not null default now(),
+  primary key (workspace_id, lead_id)
+);
 
 create index if not exists campaigns_workspace_autopilot_idx
 on public.campaigns(workspace_id, status, autopilot_enabled)
@@ -73,6 +80,7 @@ for each row execute function public.set_updated_at();
 
 alter table public.workspace_autopilot_settings enable row level security;
 alter table public.autopilot_runs enable row level security;
+alter table public.lead_campaign_ownership enable row level security;
 
 drop policy if exists "Users manage workspace autopilot settings" on public.workspace_autopilot_settings;
 create policy "Users manage workspace autopilot settings"
@@ -85,5 +93,11 @@ create policy "Users view workspace autopilot runs"
 on public.autopilot_runs for select to authenticated
 using (exists (select 1 from public.workspaces where workspaces.id = autopilot_runs.workspace_id and workspaces.owner_id = auth.uid()));
 
-revoke all on public.workspace_autopilot_settings, public.autopilot_runs from anon;
-grant select, insert, update, delete on public.workspace_autopilot_settings, public.autopilot_runs to authenticated;
+drop policy if exists "Users manage lead campaign ownership" on public.lead_campaign_ownership;
+create policy "Users manage lead campaign ownership"
+on public.lead_campaign_ownership for all to authenticated
+using (exists (select 1 from public.workspaces where workspaces.id = lead_campaign_ownership.workspace_id and workspaces.owner_id = auth.uid()))
+with check (exists (select 1 from public.workspaces where workspaces.id = lead_campaign_ownership.workspace_id and workspaces.owner_id = auth.uid()));
+
+revoke all on public.workspace_autopilot_settings, public.autopilot_runs, public.lead_campaign_ownership from anon;
+grant select, insert, update, delete on public.workspace_autopilot_settings, public.autopilot_runs, public.lead_campaign_ownership to authenticated;

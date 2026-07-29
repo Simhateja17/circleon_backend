@@ -279,13 +279,18 @@ async function upsertLeadWithContext(supabase, user, workspace, input, importRun
 
 async function assignLeadToCampaign(supabase, workspaceId, leadId, campaignId, selectedBy = null) {
   if (!campaignId) return;
-  const [{ data: campaign, error: campaignError }, { data: existing, error: existingError }] = await Promise.all([
+  const [{ data: campaign, error: campaignError }, { data: existing, error: existingError }, { data: owner, error: ownerError }] = await Promise.all([
     supabase.from('campaigns').select('id').eq('workspace_id', workspaceId).eq('id', campaignId).maybeSingle(),
     supabase.from('campaign_leads').select('campaign_id').eq('workspace_id', workspaceId).eq('lead_id', leadId).maybeSingle(),
+    supabase.from('lead_campaign_ownership').select('campaign_id').eq('workspace_id', workspaceId).eq('lead_id', leadId).maybeSingle(),
   ]);
-  if (campaignError || existingError) throw campaignError || existingError;
+  if (campaignError || existingError || ownerError) throw campaignError || existingError || ownerError;
   if (!campaign) throw new Error('Selected campaign was not found');
-  if (existing && existing.campaign_id !== campaignId) throw new Error('This lead is already assigned to another campaign');
+  if ((existing && existing.campaign_id !== campaignId) || (owner && owner.campaign_id !== campaignId)) throw new Error('This lead is already assigned to another campaign');
+  if (!owner) {
+    const { error: ownerInsertError } = await supabase.from('lead_campaign_ownership').insert({ workspace_id: workspaceId, lead_id: leadId, campaign_id: campaignId, source: 'manual' });
+    if (ownerInsertError) throw ownerInsertError;
+  }
   const { error } = await supabase.from('campaign_leads').upsert({ campaign_id: campaignId, lead_id: leadId, workspace_id: workspaceId, selected_by: selectedBy }, { onConflict: 'campaign_id,lead_id' });
   if (error) throw error;
   const { error: leadError } = await supabase.from('leads').update({ campaign_id: campaignId, lifecycle_status: 'selected_for_campaign' }).eq('id', leadId);

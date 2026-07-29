@@ -11,6 +11,10 @@ const approveSchema = z.object({
   body: z.string().trim().min(1).optional(),
 });
 
+const manualReplySchema = z.object({
+  body: z.string().trim().min(1).max(20000),
+});
+
 async function getAgentConfig(supabase, workspaceId) {
   const { data, error } = await supabase
     .from('agent_configs')
@@ -151,6 +155,71 @@ router.get('/sent', async (req, res) => {
     return res.json({ messages: data || [] });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load sent mail' });
+  }
+});
+
+router.post('/conversations/:leadId/reply', async (req, res) => {
+  try {
+    const parsed = manualReplySchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'A reply message is required', details: parsed.error.flatten() });
+
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const { data: lead, error: leadError } = await req.supabase
+      .from('leads')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('id', req.params.leadId)
+      .maybeSingle();
+    if (leadError) throw leadError;
+    if (!lead?.email) return res.status(404).json({ error: 'Lead with an email address was not found' });
+    if (lead.dnc_status === 'blocked' || lead.status === 'do_not_call') return res.status(400).json({ error: 'This lead is unsubscribed and cannot be emailed' });
+
+    const { data: history, error: historyError } = await req.supabase
+      .from('messages')
+      .select('*')
+      .eq('workspace_id', workspace.id)
+      .eq('lead_id', lead.id)
+      .not('campaign_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (historyError) throw historyError;
+    const reference = history?.[0];
+    if (!reference?.campaign_id) return res.status(400).json({ error: 'This conversation is not linked to a sending campaign' });
+
+    const subject = /^re:/i.test(reference.subject || '') ? reference.subject : `Re: ${reference.subject || 'Your email'}`;
+    const now = new Date().toISOString();
+    const { data: reply, error: replyError } = await req.supabase
+      .from('messages')
+      .insert({
+        workspace_id: workspace.id,
+        campaign_id: reference.campaign_id,
+        lead_id: lead.id,
+        direction: 'outbound',
+        subject,
+        body: parsed.data.body,
+        in_reply_to_header: reference.direction === 'inbound' ? reference.message_id_header || null : null,
+        status: 'approved',
+        approved_by: req.user.id,
+        approved_at: now,
+        approved_source: 'inbox',
+        raw_payload: { kind: 'manual_reply' },
+      })
+      .select('*')
+      .single();
+    if (replyError) throw replyError;
+
+    const queue = getEmailSendQueue();
+    await queue.add('send-manual-reply', {
+      workspaceId: workspace.id,
+      campaignId: reference.campaign_id,
+      messageId: reply.id,
+      leadId: lead.id,
+      scheduledAt: now,
+    }, { jobId: createQueueJobId('manual-reply', reply.id) });
+
+    return res.json({ message: reply });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to send manual reply' });
   }
 });
 
