@@ -33,6 +33,22 @@ async function upsertBilling(service, workspaceId, patch) {
   if (error) throw error;
 }
 
+function buildCheckoutSessionPatch(session) {
+  const patch = {
+    stripe_checkout_session_id: session.id,
+  };
+
+  if (session.customer) patch.stripe_customer_id = String(session.customer);
+  if (session.subscription) patch.stripe_subscription_id = String(session.subscription);
+  if (session.metadata?.plan) patch.plan = session.metadata.plan;
+
+  // Checkout completion is proof that Checkout finished, not the authoritative
+  // subscription state. Deliberately do not write subscription_status here:
+  // Stripe can deliver this event after customer.subscription.created, and a
+  // pending write would otherwise downgrade an already-active subscription.
+  return patch;
+}
+
 async function workspaceIdForSubscription(service, subscription) {
   const metadataId = subscription.metadata?.workspace_id;
   if (metadataId) return metadataId;
@@ -144,15 +160,29 @@ async function handleWebhook(req, res) {
     const object = event.data.object;
     if (event.type === 'checkout.session.completed') {
       const workspaceId = object.metadata?.workspace_id;
-      if (workspaceId) await upsertBilling(service, workspaceId, {
-        stripe_customer_id: String(object.customer), stripe_subscription_id: String(object.subscription),
-        stripe_checkout_session_id: object.id, plan: object.metadata?.plan || null, subscription_status: 'pending',
-      });
+      if (workspaceId) {
+        await upsertBilling(service, workspaceId, buildCheckoutSessionPatch(object));
+
+        // Refresh from Stripe's current subscription object when available so
+        // Checkout completion also works if the subscription webhook arrives
+        // later or is temporarily delayed.
+        if (object.subscription) {
+          await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(object.subscription)));
+        }
+      }
     } else if (event.type.startsWith('customer.subscription.')) {
       await syncSubscription(service, object);
     } else if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
       const subscriptionId = object.subscription;
       if (subscriptionId) await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(subscriptionId)));
+    } else if (event.type === 'invoice_payment.paid') {
+      const invoiceId = typeof object.invoice === 'string' ? object.invoice : object.invoice?.id;
+      if (invoiceId) {
+        const invoice = await stripeClient().invoices.retrieve(String(invoiceId));
+        if (invoice.subscription) {
+          await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(invoice.subscription)));
+        }
+      }
     }
     const { error: processedError } = await service.from('stripe_webhook_events').update({ processed_at: new Date().toISOString() }).eq('event_id', event.id);
     if (processedError) throw processedError;
@@ -162,4 +192,4 @@ async function handleWebhook(req, res) {
   }
 }
 
-module.exports = { router, handleWebhook };
+module.exports = { router, handleWebhook, buildCheckoutSessionPatch };
