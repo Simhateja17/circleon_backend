@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { actorInput } = require('../lib/apify');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
 const { normalizeResearch } = require('../lib/leadResearch');
+const { sequenceWordTarget } = require('../lib/gemini');
 const { enqueueGeneration } = require('../workers/lead-research.worker');
 
 const NOW = new Date('2026-08-06T08:00:00.000Z');
@@ -140,4 +141,25 @@ test('lead research hands off to campaign generation with a valid queue job id',
     { workspaceId: 'workspace-1', campaignId: 'campaign-1', leadIds: ['lead-1'] },
     { jobId: 'campaign-generate-campaign-1' },
   ]);
+});
+
+test('email repair targets stay safely inside the validator limits', () => {
+  assert.deepEqual(sequenceWordTarget({ step_number: 1, name: 'Intro' }), {
+    subjectMin: 4,
+    subjectMax: 6,
+    bodyMin: 55,
+    bodyMax: 62,
+  });
+  assert.deepEqual(sequenceWordTarget({ step_number: 2, name: 'Bump' }), {
+    subjectMin: 4,
+    subjectMax: 6,
+    bodyMin: 24,
+    bodyMax: 30,
+  });
+  assert.deepEqual(sequenceWordTarget({ step_number: 3, name: 'Breakup' }), {
+    subjectMin: 4,
+    subjectMax: 6,
+    bodyMin: 22,
+    bodyMax: 27,
+  });
 });
