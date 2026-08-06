@@ -28,6 +28,22 @@ test('Apify actor inputs preserve public URLs and configured research limits', (
   assert.equal(actorInput('website', 'https://acme.example', config).maxCrawlPages, 20);
 });
 
+test('research target builder extracts a LinkedIn username from the canonical lead URL', () => {
+  const targets = getResearchTargets({
+    email: 'jarrod@browncapital.com.au',
+    linkedin_url: 'http://www.linkedin.com/in/jarrodrjbrown',
+    company_domain: 'stonecreekglobal.com',
+    company_data: {
+      linkedin_url: 'http://www.linkedin.com/company/stone-creek-global',
+      domain: 'stonecreekglobal.com',
+    },
+  });
+
+  assert.equal(targets.personUsername, 'jarrodrjbrown');
+  assert.equal(targets.companyUrl, 'http://www.linkedin.com/company/stone-creek-global');
+  assert.equal(targets.websiteUrl, 'https://stonecreekglobal.com');
+});
+
 test('Apollo bulk matches preserve person and company LinkedIn targets', () => {
   const updates = extractBulkMatchUpdates({
     request_id: 'request-1',
