@@ -1,9 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { actorInput } = require('../lib/apify');
+const { actorInput, businessEmailDomain, getResearchTargets } = require('../lib/apify');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
-const { normalizeResearch } = require('../lib/leadResearch');
+const { normalizeResearch, shouldRefreshApifyResearch } = require('../lib/leadResearch');
 const { sequenceWordTarget } = require('../lib/gemini');
 const { enqueueGeneration } = require('../workers/lead-research.worker');
 
@@ -25,6 +25,28 @@ test('Apify actor inputs preserve public URLs and configured research limits', (
     limit: 10,
   });
   assert.equal(actorInput('website', 'https://acme.example', config).maxCrawlPages, 20);
+});
+
+test('research can use a verified business email domain when Apollo has no website URL', () => {
+  assert.equal(businessEmailDomain('alfonso_andrew@ite.edu.sg'), 'ite.edu.sg');
+  assert.equal(businessEmailDomain('person@gmail.com'), null);
+  assert.deepEqual(getResearchTargets({ email: 'alfonso_andrew@ite.edu.sg' }), {
+    personUrl: null,
+    personUsername: null,
+    companyUrl: null,
+    websiteUrl: 'https://ite.edu.sg',
+  });
+});
+
+test('Apify refresh bypasses an otherwise fresh Apollo fallback cache when a target exists', () => {
+  const lead = {
+    research_status: 'fallback',
+    research_expires_at: '2026-08-13T12:39:47.476Z',
+    personalization_profile: { source: 'apollo_fallback' },
+  };
+  const targets = getResearchTargets({ ...lead, email: 'alfonso_andrew@ite.edu.sg' });
+  assert.equal(shouldRefreshApifyResearch(lead, targets, { enabled: true }), true);
+  assert.equal(shouldRefreshApifyResearch(lead, targets, { enabled: false }), false);
 });
 
 test('research normalization prioritizes recent public posts and keeps provenance', () => {
