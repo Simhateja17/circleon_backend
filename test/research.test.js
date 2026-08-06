@@ -3,8 +3,8 @@ const assert = require('node:assert/strict');
 
 const { actorInput, businessEmailDomain, getResearchTargets } = require('../lib/apify');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
-const { normalizeResearch, shouldRefreshApifyResearch } = require('../lib/leadResearch');
-const { sequenceWordTarget } = require('../lib/gemini');
+const { normalizeResearch, saveNormalizedProfile, shouldRefreshApifyResearch } = require('../lib/leadResearch');
+const { sequenceSubjectTarget } = require('../lib/gemini');
 const { enqueueGeneration } = require('../workers/lead-research.worker');
 
 const NOW = new Date('2026-08-06T08:00:00.000Z');
@@ -106,7 +106,44 @@ test('research normalization falls back to explicit Apollo fields without invent
   assert.equal(profile.evidence.some(item => item.source_type === 'linkedin_person_post'), false);
 });
 
-test('email validation enforces concise sequence lengths and rejects source disclosure', () => {
+test('research profile persistence stores actor references from the Apify run', async () => {
+  const patches = {};
+  const supabase = {
+    from(table) {
+      return {
+        insert: async () => ({ error: null }),
+        update(patch) {
+          patches[table] = patch;
+          return {
+            eq() { return this; },
+            select() { return this; },
+            single: async () => ({ data: { id: 'run-1', ...patch }, error: null }),
+          };
+        },
+      };
+    },
+  };
+  const actorRefs = [{ kind: 'website', run_id: 'apify-run-1', status: 'succeeded' }];
+
+  const saved = await saveNormalizedProfile({
+    supabase,
+    lead: { id: 'lead-1', research_profile_version: 0, personalization_profile_version: 0 },
+    workspaceId: 'workspace-1',
+    campaignId: 'campaign-1',
+    run: { id: 'run-1' },
+    profile: { source: 'apify', evidence: [], personalization_score: 2, source_fields_used: [] },
+    status: 'completed',
+    runStatus: 'completed',
+    actorRefs,
+    config: { cacheTtlDays: 7 },
+    now: NOW,
+  });
+
+  assert.equal(saved.id, 'run-1');
+  assert.deepEqual(patches.lead_research_runs.actor_refs, actorRefs);
+});
+
+test('email validation keeps safety checks while allowing useful longer bodies', () => {
   const validBody = [
     'Hi Jane,',
     'Your dispatch workflow for regional teams stood out because operations teams often need a simple way to keep new processes visible.',
@@ -121,6 +158,16 @@ test('email validation enforces concise sequence lengths and rejects source disc
     personalizationScore: 3,
   });
   assert.equal(valid.valid, true);
+
+  const longerFollowUp = validateEmailDraft({
+    step: { step_number: 2, name: 'Follow-up' },
+    email: {
+      subject: 'A simpler hiring support option',
+      body: 'One idea worth considering is using external support to cover peak hiring periods without forcing a permanent team change. That can give your internal team more flexibility while keeping priorities moving. If that is useful, I can outline a simple setup and the expected handoff in 10 minutes.',
+    },
+  });
+  assert.ok(longerFollowUp.bodyWords > 35);
+  assert.equal(longerFollowUp.valid, true);
 
   const invalid = validateEmailDraft({
     step: { step_number: 1, name: 'Intro' },
@@ -165,23 +212,13 @@ test('lead research hands off to campaign generation with a valid queue job id',
   ]);
 });
 
-test('email repair targets stay safely inside the validator limits', () => {
-  assert.deepEqual(sequenceWordTarget({ step_number: 1, name: 'Intro' }), {
+test('email subject targets remain concise without body word targets', () => {
+  assert.deepEqual(sequenceSubjectTarget({ step_number: 1, name: 'Intro' }), {
     subjectMin: 4,
     subjectMax: 6,
-    bodyMin: 55,
-    bodyMax: 62,
   });
-  assert.deepEqual(sequenceWordTarget({ step_number: 2, name: 'Bump' }), {
+  assert.deepEqual(sequenceSubjectTarget({ step_number: 3, name: 'Breakup' }), {
     subjectMin: 4,
     subjectMax: 6,
-    bodyMin: 24,
-    bodyMax: 30,
-  });
-  assert.deepEqual(sequenceWordTarget({ step_number: 3, name: 'Breakup' }), {
-    subjectMin: 4,
-    subjectMax: 6,
-    bodyMin: 22,
-    bodyMax: 27,
   });
 });
