@@ -1,6 +1,6 @@
 -- Evidence-backed public research for email writing.
 -- Apollo remains canonical for lead identity and contact fields. Apify writes
--- only research records and the compact personalization profile.
+-- only research records and the compact personalization profile .
 
 alter table public.leads
   add column if not exists research_status text not null default 'not_started',
