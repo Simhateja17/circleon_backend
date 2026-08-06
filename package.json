@@ -8,8 +8,9 @@
     "test": "SUPABASE_URL=http://127.0.0.1:54321 SUPABASE_ANON_KEY=test node --test test/*.test.js",
     "worker:send-email": "node workers/send-email.worker.js",
     "worker:poll-inbox": "node workers/poll-inbox.worker.js",
-    "worker:lead-import": "node workers/lead-import.worker.js"
-    ,"worker:autopilot": "node workers/autopilot.worker.js"
+    "worker:lead-import": "node workers/lead-import.worker.js",
+    "worker:lead-research": "node workers/lead-research.worker.js",
+    "worker:autopilot": "node workers/autopilot.worker.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

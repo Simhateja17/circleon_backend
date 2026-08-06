@@ -3,7 +3,12 @@ const crypto = require('node:crypto');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { getPreviewMessages, preGenerateSequence, regenerateSequenceMessage } = require('../lib/emailSequence');
-const { createQueueJobId, getCampaignGenerationQueue, getEmailSendQueue } = require('../lib/redis');
+const {
+  createQueueJobId,
+  getCampaignGenerationQueue,
+  getEmailSendQueue,
+  getLeadResearchQueue,
+} = require('../lib/redis');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const { requireActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
@@ -132,6 +137,10 @@ const campaignBriefSchema = z.object({
   campaign_angle: z.string().trim().max(1200).optional().default(''),
   cta: z.string().trim().max(500).optional().default(''),
   tone: z.string().trim().max(120).optional().default(''),
+  proof: z.string().trim().max(1200).optional().default(''),
+  language: z.string().trim().max(80).optional().default('English'),
+  signature: z.string().trim().max(1200).optional().default(''),
+  sector: z.string().trim().max(120).optional().default(''),
 });
 
 const campaignSchema = z.object({
@@ -169,6 +178,19 @@ function campaignBrief(agentConfig, brief = {}) {
     campaign_angle: brief.campaign_angle || '',
     cta: brief.cta || agentConfig?.booking_link || '',
     tone: brief.tone || agentConfig?.tone || '',
+    proof: brief.proof || '',
+    language: brief.language || 'English',
+    signature: brief.signature || '',
+    sector: brief.sector || '',
+    writing_config: {
+      angle: brief.campaign_angle || '',
+      cta: brief.cta || agentConfig?.booking_link || '',
+      tone: brief.tone || agentConfig?.tone || '',
+      proof: brief.proof || '',
+      language: brief.language || 'English',
+      signature: brief.signature || '',
+      sector: brief.sector || '',
+    },
   };
 }
 
@@ -590,17 +612,30 @@ router.post('/:campaignId/sequences/:stepNumber/attachment', async (req, res) =>
   }
 });
 
-async function generationSnapshot(queue, campaignId) {
-  const jobId = createQueueJobId('campaign-generate', campaignId);
+async function queueSnapshot(queue, jobId, stage) {
   const job = await queue.getJob(jobId);
-  if (!job) return { job_id: null, status: 'idle', progress: null };
+  if (!job) return null;
   const state = await job.getState();
   return {
     job_id: job.id,
     status: state,
+    stage,
     progress: job.progress || null,
     failed_reason: job.failedReason || null,
   };
+}
+
+async function generationSnapshot(generationQueue, researchQueue, campaignId) {
+  const [research, generation] = await Promise.all([
+    queueSnapshot(researchQueue, createQueueJobId('campaign-research', campaignId), 'researching'),
+    queueSnapshot(generationQueue, createQueueJobId('campaign-generate', campaignId), 'writing'),
+  ]);
+  const activeStates = ['waiting', 'active', 'delayed', 'prioritized'];
+  if (generation && activeStates.includes(generation.status)) return generation;
+  if (research && activeStates.includes(research.status)) return research;
+  if (generation) return generation;
+  if (research) return research.status === 'completed' ? { ...research, stage: 'research_complete' } : research;
+  return { job_id: null, status: 'idle', stage: null, progress: null };
 }
 
 router.post('/:campaignId/generate', async (req, res) => {
@@ -628,31 +663,38 @@ router.post('/:campaignId/generate', async (req, res) => {
       return res.status(400).json({ error: 'No selected leads are ready with a verified work email', blocked });
     }
 
-    const queue = getCampaignGenerationQueue();
-    const jobId = createQueueJobId('campaign-generate', campaign.id);
-    const existingJob = await queue.getJob(jobId);
-    const existingState = existingJob ? await existingJob.getState() : null;
-    if (existingJob && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingState)) {
+    const generationQueue = getCampaignGenerationQueue();
+    const researchQueue = getLeadResearchQueue();
+    const generationJobId = createQueueJobId('campaign-generate', campaign.id);
+    const researchJobId = createQueueJobId('campaign-research', campaign.id);
+    const existingGenerationJob = await generationQueue.getJob(generationJobId);
+    const existingResearchJob = await researchQueue.getJob(researchJobId);
+    const [existingGenerationState, existingResearchState] = await Promise.all([
+      existingGenerationJob ? existingGenerationJob.getState() : null,
+      existingResearchJob ? existingResearchJob.getState() : null,
+    ]);
+    if ((existingGenerationJob && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingGenerationState))
+      || (existingResearchJob && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingResearchState))) {
       console.info(JSON.stringify({
         event: 'campaign_generation_reused',
         campaignId: campaign.id,
         workspaceId: workspace.id,
-        jobId,
-        status: existingState,
+        jobId: existingResearchState && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingResearchState) ? researchJobId : generationJobId,
+        status: existingResearchState && ['waiting', 'active', 'delayed', 'prioritized'].includes(existingResearchState) ? existingResearchState : existingGenerationState,
       }));
-      return res.json({ campaign, generation: await generationSnapshot(queue, campaign.id), blocked });
+      return res.json({ campaign, generation: await generationSnapshot(generationQueue, researchQueue, campaign.id), blocked });
     }
-    if (existingJob) await existingJob.remove();
-    await queue.add('generate-sequence', {
+    if (existingResearchJob) await existingResearchJob.remove();
+    await researchQueue.add('research-campaign', {
       workspaceId: workspace.id,
       campaignId: campaign.id,
       leadIds: eligibleLeadIds,
-    }, { jobId });
+    }, { jobId: researchJobId });
     console.info(JSON.stringify({
-      event: 'campaign_generation_queued',
+      event: 'campaign_research_queued',
       campaignId: campaign.id,
       workspaceId: workspace.id,
-      jobId,
+      jobId: researchJobId,
       selectedLeads: selectedLeadIds.length,
       eligibleLeads: eligibleLeadIds.length,
       blockedLeads: blocked.length,
@@ -660,7 +702,12 @@ router.post('/:campaignId/generate', async (req, res) => {
     }));
     return res.status(202).json({
       campaign,
-      generation: { job_id: jobId, status: 'waiting', progress: { total: eligibleLeadIds.length, processed: 0, generated: 0, skipped: 0, failed: 0 } },
+      generation: {
+        job_id: researchJobId,
+        status: 'waiting',
+        stage: 'researching',
+        progress: { total: eligibleLeadIds.length, processed: 0, researched: 0, fallback: 0, generated: 0, skipped: 0, failed: 0 },
+      },
       blocked,
     });
   } catch (error) {
@@ -678,9 +725,10 @@ router.get('/:campaignId/generation', async (req, res) => {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const campaign = await loadCampaign(req, workspace.id, req.params.campaignId);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
-    const queue = getCampaignGenerationQueue();
+    const generationQueue = getCampaignGenerationQueue();
+    const researchQueue = getLeadResearchQueue();
     const [generation, preview] = await Promise.all([
-      generationSnapshot(queue, campaign.id),
+      generationSnapshot(generationQueue, researchQueue, campaign.id),
       getPreviewMessages({ supabase: req.supabase, workspaceId: workspace.id, campaignId: campaign.id, limit: 500 }),
     ]);
     return res.json({ generation: { ...generation, generated_messages: preview.length } });
@@ -710,7 +758,7 @@ router.get('/:campaignId/messages', async (req, res) => {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const { data, error } = await req.supabase
       .from('messages')
-      .select('*, leads(full_name, company_name, title, email)')
+      .select('*, leads(full_name, company_name, title, email, research_status, research_last_error, personalization_profile)')
       .eq('workspace_id', workspace.id)
       .eq('campaign_id', req.params.campaignId)
       .order('created_at', { ascending: false });

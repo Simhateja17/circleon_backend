@@ -8,6 +8,7 @@ const { mailboxReady } = require('../lib/autopilotScheduler');
 const { runApolloImport } = require('../routes/apollo');
 const { preGenerateSequence } = require('../lib/emailSequence');
 const { scheduleMessages } = require('../lib/campaignScheduling');
+const { researchCampaign, scheduleResearchReconciliation } = require('../lib/leadResearch');
 
 async function updateRun(service, runId, patch) {
   const { data, error } = await service.from('autopilot_runs').update(patch).eq('id', runId).select('*').single();
@@ -41,6 +42,13 @@ async function processAutopilotJob(job) {
 
   await updateRun(service, run.id, { status: 'running', started_at: new Date().toISOString(), error_message: null });
   await service.from('campaigns').update({ autopilot_enabled: true }).eq('id', campaignId);
+  console.info(JSON.stringify({
+    event: 'autopilot_processing',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+  }));
   const filters = campaignFilters(campaign, agentConfig);
   const { data: importRun, error: importError } = await service.from('lead_import_runs').insert({
     workspace_id: workspaceId,
@@ -58,6 +66,17 @@ async function processAutopilotJob(job) {
     .eq('workspace_id', workspaceId).eq('import_run_id', importRun.id).eq('lifecycle_status', 'ready');
   if (leadsError) throw leadsError;
   const leadIds = (readyLeads || []).map(lead => lead.id);
+  console.info(JSON.stringify({
+    event: 'autopilot_lead_discovery_completed',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+    discovered: Number(completedImport.created_count || 0),
+    readyLeads: leadIds.length,
+    importRunId: importRun.id,
+    importStatus: completedImport.status,
+  }));
   if (leadIds.length) {
     const { error: ownershipError } = await service.from('lead_campaign_ownership').upsert(leadIds.map(leadId => ({ workspace_id: workspaceId, lead_id: leadId, campaign_id: campaignId, source: 'autopilot' })), {
       onConflict: 'workspace_id,lead_id', ignoreDuplicates: true,
@@ -76,24 +95,80 @@ async function processAutopilotJob(job) {
     leadIds.splice(0, leadIds.length, ...ownedLeadIds);
   }
 
-  let generation = { generated: 0, failed: 0 };
+  let research = { total: 0, researched: 0, skipped: 0, fallback: 0, failed: 0, timed_out: 0, errors: [] };
+  if (leadIds.length) {
+    research = await researchCampaign({
+      supabase: service,
+      workspaceId,
+      campaignId,
+      leadIds,
+      concurrency: Number(process.env.APIFY_RESEARCH_CONCURRENCY || 2),
+    });
+  }
+  const reconciliationQueued = await scheduleResearchReconciliation(research.reconciliation_refs || []);
+  research = { ...research, reconciliation_queued: reconciliationQueued };
+  console.info(JSON.stringify({
+    event: 'autopilot_research_completed',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+    ...research,
+  }));
+  let generation = { generated: 0, failed: 0, skipped: 0 };
   if (leadIds.length) generation = await preGenerateSequence({ supabase: service, workspaceId, campaignId, leadIds, concurrency: Number(process.env.AUTOPILOT_GENERATION_CONCURRENCY || 1) });
+  console.info(JSON.stringify({
+    event: 'autopilot_generation_completed',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+    ...generation,
+  }));
   const { data: firstMessages, error: messageError } = await service.from('messages').select('id, lead_id, sequence_step')
     .eq('workspace_id', workspaceId).eq('campaign_id', campaignId).eq('direction', 'outbound').eq('sequence_step', 1).eq('status', 'draft').is('scheduled_at', null).in('lead_id', leadIds);
   if (messageError) throw messageError;
   const jobs = await scheduleMessages({ supabase: service, queue: getEmailSendQueue(), workspaceId, campaign, messages: firstMessages || [], reason: 'Autopilot daily run' });
+  console.info(JSON.stringify({
+    event: 'autopilot_email_scheduling_completed',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+    draftStepOneMessages: firstMessages?.length || 0,
+    scheduled: jobs.length,
+  }));
   const pending = completedImport.status === 'pending_enrichment';
   await updateRun(service, run.id, {
-    status: pending || generation.failed ? 'partial' : 'completed',
+    status: pending || generation.failed || research.failed ? 'partial' : 'completed',
     discovered_leads: Number(completedImport.created_count || 0),
     assigned_leads: leadIds.length,
     generated_messages: Number(generation.generated || 0),
     scheduled_messages: jobs.length,
     skipped_duplicates: Number(completedImport.skipped_count || 0),
     completed_at: new Date().toISOString(),
-    details: { ...(run.details || {}), import_run_id: importRun.id, pending_enrichment: pending, filters },
+    details: { ...(run.details || {}), import_run_id: importRun.id, pending_enrichment: pending, filters, research },
   });
-  return { importRunId: importRun.id, assignedLeads: leadIds.length, generated: generation.generated || 0, scheduled: jobs.length, partial: pending || Boolean(generation.failed) };
+  console.info(JSON.stringify({
+    event: 'autopilot_completed',
+    jobId: job.id,
+    autopilotRunId,
+    workspaceId,
+    campaignId,
+    assignedLeads: leadIds.length,
+    generated: generation.generated || 0,
+    scheduled: jobs.length,
+    partial: pending || Boolean(generation.failed) || Boolean(research.failed),
+  }));
+  return {
+    importRunId: importRun.id,
+    assignedLeads: leadIds.length,
+    researched: research.researched || 0,
+    researchFallback: research.fallback || 0,
+    generated: generation.generated || 0,
+    scheduled: jobs.length,
+    partial: pending || Boolean(generation.failed) || Boolean(research.failed),
+  };
 }
 
 function createWorker() {

@@ -18,6 +18,7 @@ const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
 const { createWorker: createLeadImportWorker } = require('./workers/lead-import.worker');
+const { createWorker: createLeadResearchWorker } = require('./workers/lead-research.worker');
 const { createWorker: createAutopilotWorker } = require('./workers/autopilot.worker');
 const { startAutopilotScheduler } = require('./lib/autopilotScheduler');
 
@@ -75,6 +76,18 @@ app.listen(PORT, () => {
     }
   } else {
     console.log('[lead-import-worker] in-process worker disabled');
+  }
+  const runLeadResearchWorkerInProcess = process.env.APIFY_RESEARCH_WORKER_ENABLED === 'true'
+    || (process.env.APIFY_RESEARCH_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
+  if (runLeadResearchWorkerInProcess) {
+    try {
+      createLeadResearchWorker();
+      console.log('[lead-research-worker] running in this process');
+    } catch (error) {
+      console.error('[lead-research-worker] failed to start', error.message);
+    }
+  } else {
+    console.log('[lead-research-worker] in-process worker disabled');
   }
   const runAutopilotWorkerInProcess = process.env.AUTOPILOT_WORKER_ENABLED === 'true'
     || (process.env.AUTOPILOT_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
