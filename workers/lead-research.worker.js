@@ -3,14 +3,14 @@ require('dotenv').config();
 const { Worker } = require('bullmq');
 const { createServiceClient } = require('../lib/supabase');
 const {
+  createQueueJobId,
   getCampaignGenerationQueue,
   getRedisConnection,
 } = require('../lib/redis');
 const { getApifyConfig } = require('../lib/apify');
 const { reconcileResearchRun, researchCampaign, scheduleResearchReconciliation } = require('../lib/leadResearch');
 
-async function enqueueGeneration({ workspaceId, campaignId, leadIds }) {
-  const queue = getCampaignGenerationQueue();
+async function enqueueGeneration({ workspaceId, campaignId, leadIds, queue = getCampaignGenerationQueue() }) {
   const jobId = createQueueJobId('campaign-generate', campaignId);
   const existing = await queue.getJob(jobId);
   if (existing) {
@@ -125,4 +125,4 @@ function createWorker() {
 
 if (require.main === module) createWorker();
 
-module.exports = { createWorker, processLeadResearchJob, scheduleReconciliation: scheduleResearchReconciliation };
+module.exports = { createWorker, enqueueGeneration, processLeadResearchJob, scheduleReconciliation: scheduleResearchReconciliation };

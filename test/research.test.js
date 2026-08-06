@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { actorInput } = require('../lib/apify');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
 const { normalizeResearch } = require('../lib/leadResearch');
+const { enqueueGeneration } = require('../workers/lead-research.worker');
 
 const NOW = new Date('2026-08-06T08:00:00.000Z');
 
@@ -118,4 +119,25 @@ test('email validation enforces concise sequence lengths and rejects source disc
 test('campaign signatures are appended without being changed by the writer', () => {
   assert.equal(appendSignature('Hello there.', 'Teja\nBarsha'), 'Hello there.\n\nTeja\nBarsha');
   assert.equal(appendSignature('Hello there.\n\nTeja\nBarsha', 'Teja\nBarsha'), 'Hello there.\n\nTeja\nBarsha');
+});
+
+test('lead research hands off to campaign generation with a valid queue job id', async () => {
+  const added = [];
+  const queue = {
+    getJob: async () => null,
+    add: async (...args) => { added.push(args); },
+  };
+  const result = await enqueueGeneration({
+    workspaceId: 'workspace-1',
+    campaignId: 'campaign-1',
+    leadIds: ['lead-1'],
+    queue,
+  });
+
+  assert.equal(result.jobId, 'campaign-generate-campaign-1');
+  assert.deepEqual(added[0], [
+    'generate-sequence',
+    { workspaceId: 'workspace-1', campaignId: 'campaign-1', leadIds: ['lead-1'] },
+    { jobId: 'campaign-generate-campaign-1' },
+  ]);
 });
