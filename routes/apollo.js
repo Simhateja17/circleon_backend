@@ -10,8 +10,10 @@ const {
   APOLLO_INDUSTRIES,
   apolloPersonId,
   buildPersonalizationProfile,
+  buildApolloMatchProfilePatch,
   buildDefaultFilters,
   enrichOrganizationForPerson,
+  extractBulkMatchUpdates,
   extractWebhookUpdates,
   normalizeApolloLead,
   normalizeFilters,
@@ -94,6 +96,56 @@ async function recordEnrichmentRequests(supabase, workspaceId, importRunId, batc
   });
 }
 
+async function applyApolloMatchProfiles(supabase, workspaceId, batches, leadByPersonId) {
+  const matchUpdates = [];
+  for (const batch of batches || []) {
+    const matches = extractBulkMatchUpdates(batch.payload || {});
+    for (const matchUpdate of matches) {
+      const leadId = leadByPersonId.get(matchUpdate.personId);
+      if (leadId) matchUpdates.push({ ...matchUpdate, leadId });
+    }
+  }
+  if (!matchUpdates.length) return { updated: 0 };
+
+  const leadIds = [...new Set(matchUpdates.map(update => update.leadId))];
+  const { data: leads, error: leadError } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('workspace_id', workspaceId)
+    .in('id', leadIds);
+  if (leadError) throw leadError;
+  const leadsById = new Map((leads || []).map(lead => [lead.id, lead]));
+  let updated = 0;
+
+  for (const matchUpdate of matchUpdates) {
+    const lead = leadsById.get(matchUpdate.leadId);
+    if (!lead) continue;
+    const profilePatch = buildApolloMatchProfilePatch(lead, matchUpdate);
+    const { error: updateError } = await supabase
+      .from('leads')
+      .update({
+        ...profilePatch,
+        raw_data: mergeRawData(lead.raw_data, {
+          bulkMatch: matchUpdate.match,
+          bulk_match_status: 'completed',
+        }),
+      })
+      .eq('workspace_id', workspaceId)
+      .eq('id', lead.id);
+    if (updateError) throw updateError;
+    updated += 1;
+    debug('bulk_match_profile_applied', {
+      leadId: lead.id,
+      personId: matchUpdate.personId,
+      hasPersonLinkedin: Boolean(matchUpdate.linkedinUrl),
+      hasCompanyLinkedin: Boolean(matchUpdate.companyLinkedinUrl),
+      hasCompanyDomain: Boolean(matchUpdate.companyDomain),
+    });
+  }
+
+  return { updated };
+}
+
 async function findLeadForApolloUpdate(supabase, item) {
   if (item.requestId) {
     let requestQuery = supabase
@@ -151,6 +203,8 @@ async function requestNextEnrichmentBatch(supabase, run) {
   const leadByPersonId = new Map(next.map(lead => [lead.external_id, lead.id]));
   const batches = await requestBulkEnrichment(people, run.id);
   await recordEnrichmentRequests(supabase, run.workspace_id, run.id, batches, leadByPersonId);
+  const profileSync = await applyApolloMatchProfiles(supabase, run.workspace_id, batches, leadByPersonId);
+  if (profileSync.updated) debug('bulk_match_profiles_synced', { importRunId: run.id, updated: profileSync.updated });
   return { requested: people.length, requestIds: batches.map(batch => batch.request_id).filter(Boolean) };
 }
 
@@ -242,7 +296,13 @@ async function applyApolloUpdates(supabase, updates) {
     const canUseApolloEmail = !lead.email || lead.email_source === 'apollo';
     const canonicalEmail = canUseApolloEmail ? item.email : lead.email;
     const emailReady = usableEmail(canonicalEmail);
-    const person = lead.raw_data?.apollo?.searchPerson || {};
+    const searchPerson = lead.raw_data?.apollo?.searchPerson || {};
+    const bulkMatch = lead.raw_data?.apollo?.bulkMatch || {};
+    const person = {
+      ...searchPerson,
+      ...bulkMatch,
+      organization: bulkMatch.organization || searchPerson.organization,
+    };
     const enrichedAt = new Date().toISOString();
 
     if (!emailReady) {
@@ -269,6 +329,22 @@ async function applyApolloUpdates(supabase, updates) {
     }
 
     const companyData = await enrichOrganizationForPerson(person);
+    const personLinkedinUrl = item.linkedinUrl || lead.linkedin_url || person.linkedin_url || null;
+    const companyLinkedinUrl = item.companyLinkedinUrl
+      || companyData.linkedin_url
+      || person.organization?.linkedin_url
+      || lead.company_data?.linkedin_url
+      || null;
+    const companyDomain = item.companyDomain
+      || companyData.domain
+      || lead.company_domain
+      || lead.company_data?.domain
+      || null;
+    const canonicalCompanyData = {
+      ...companyData,
+      ...(companyLinkedinUrl ? { linkedin_url: companyLinkedinUrl } : {}),
+      ...(companyDomain ? { domain: companyDomain } : {}),
+    };
     const patch = {
       raw_data: mergeRawData(lead.raw_data, {
         enrichmentWebhook: item.raw,
@@ -279,9 +355,11 @@ async function applyApolloUpdates(supabase, updates) {
       enrichment_status: 'completed',
       last_enriched_at: enrichedAt,
       rejection_reason: null,
-      company_data: companyData,
-      personalization_profile: buildPersonalizationProfile(person, companyData, enrichedAt),
+      company_data: canonicalCompanyData,
+      personalization_profile: buildPersonalizationProfile(person, canonicalCompanyData, enrichedAt),
     };
+    if (personLinkedinUrl) patch.linkedin_url = personLinkedinUrl;
+    if (companyDomain) patch.company_domain = companyDomain;
     if (item.email && canUseApolloEmail) {
       patch.email = item.email;
       patch.email_status = 'verified';
@@ -649,6 +727,8 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
       });
       const batches = await requestBulkEnrichment(batchPeople, run.id);
       await recordEnrichmentRequests(supabase, workspace.id, run.id, batches, leadByPersonId);
+      const profileSync = await applyApolloMatchProfiles(supabase, workspace.id, batches, leadByPersonId);
+      if (profileSync.updated) debug('bulk_match_profiles_synced', { importRunId: run.id, updated: profileSync.updated });
       const batchRequestIds = batches.map(batch => batch.request_id).filter(Boolean);
       requestIds.push(...batchRequestIds);
       await pollAndApplyApolloRequests(supabase, batchRequestIds);
@@ -813,7 +893,9 @@ router.post('/retry/:leadId', async (req, res) => {
       rejection_reason: null,
     }).eq('id', lead.id);
     const batches = await requestBulkEnrichment([person], lead.import_run_id);
-    await recordEnrichmentRequests(req.supabase, workspace.id, lead.import_run_id, batches, new Map([[lead.external_id, lead.id]]));
+    const leadByPersonId = new Map([[lead.external_id, lead.id]]);
+    await recordEnrichmentRequests(req.supabase, workspace.id, lead.import_run_id, batches, leadByPersonId);
+    await applyApolloMatchProfiles(req.supabase, workspace.id, batches, leadByPersonId);
     return res.status(202).json({ lead_id: lead.id, request_ids: batches.map(batch => batch.request_id).filter(Boolean) });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to retry Apollo enrichment' });
