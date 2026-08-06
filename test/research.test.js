@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { actorInput, businessEmailDomain, getResearchTargets } = require('../lib/apify');
+const { extractBulkMatchUpdates, normalizeApolloLead } = require('../lib/apollo');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
 const { normalizeResearch, saveNormalizedProfile, shouldRefreshApifyResearch } = require('../lib/leadResearch');
 const { sequenceSubjectTarget } = require('../lib/gemini');
@@ -25,6 +26,48 @@ test('Apify actor inputs preserve public URLs and configured research limits', (
     limit: 10,
   });
   assert.equal(actorInput('website', 'https://acme.example', config).maxCrawlPages, 20);
+});
+
+test('Apollo bulk matches preserve person and company LinkedIn targets', () => {
+  const updates = extractBulkMatchUpdates({
+    request_id: 'request-1',
+    matches: [{
+      id: 'apollo-person-1',
+      first_name: 'Jane',
+      last_name: 'Doe',
+      linkedin_url: 'http://www.linkedin.com/in/jane-doe',
+      organization: {
+        name: 'Acme',
+        linkedin_url: 'http://www.linkedin.com/company/acme',
+        website_url: 'https://acme.example',
+      },
+    }],
+  });
+
+  assert.equal(updates[0].personId, 'apollo-person-1');
+  assert.equal(updates[0].linkedinUrl, 'http://www.linkedin.com/in/jane-doe');
+  assert.equal(updates[0].companyLinkedinUrl, 'http://www.linkedin.com/company/acme');
+  assert.equal(updates[0].companyDomain, 'acme.example');
+  assert.equal(updates[0].match.organization.name, 'Acme');
+});
+
+test('Apollo normalization promotes LinkedIn and company domain fields', () => {
+  const lead = normalizeApolloLead({
+    id: 'apollo-person-1',
+    first_name: 'Jane',
+    last_name: 'Doe',
+    linkedin_url: 'http://www.linkedin.com/in/jane-doe',
+    organization: {
+      name: 'Acme',
+      linkedin_url: 'http://www.linkedin.com/company/acme',
+      website_url: 'https://acme.example',
+    },
+  });
+
+  assert.equal(lead.linkedin_url, 'http://www.linkedin.com/in/jane-doe');
+  assert.equal(lead.company_domain, 'acme.example');
+  assert.equal(lead.company_data.linkedin_url, 'http://www.linkedin.com/company/acme');
+  assert.equal(lead.personalization_profile.company.linkedin_url, 'http://www.linkedin.com/company/acme');
 });
 
 test('research can use a verified business email domain when Apollo has no website URL', () => {
