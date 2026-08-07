@@ -303,6 +303,7 @@ async function applyApolloUpdates(supabase, updates) {
       ...bulkMatch,
       organization: bulkMatch.organization || searchPerson.organization,
     };
+    const normalizedPerson = normalizeApolloLead(person);
     const enrichedAt = new Date().toISOString();
 
     if (!emailReady) {
@@ -358,6 +359,11 @@ async function applyApolloUpdates(supabase, updates) {
       company_data: canonicalCompanyData,
       personalization_profile: buildPersonalizationProfile(person, canonicalCompanyData, enrichedAt),
     };
+    if (normalizedPerson.first_name) patch.first_name = normalizedPerson.first_name;
+    if (normalizedPerson.last_name) patch.last_name = normalizedPerson.last_name;
+    if (normalizedPerson.full_name && normalizedPerson.full_name !== 'Apollo lead') {
+      patch.full_name = normalizedPerson.full_name;
+    }
     if (personLinkedinUrl) patch.linkedin_url = personLinkedinUrl;
     if (companyDomain) patch.company_domain = companyDomain;
     if (item.email && canUseApolloEmail) {

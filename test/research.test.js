@@ -5,7 +5,7 @@ const { actorInput, businessEmailDomain, getResearchTargets } = require('../lib/
 const { buildApolloMatchProfilePatch, extractBulkMatchUpdates, normalizeApolloLead } = require('../lib/apollo');
 const { appendSignature, validateEmailDraft } = require('../lib/emailValidation');
 const { normalizeResearch, saveNormalizedProfile, shouldRefreshApifyResearch } = require('../lib/leadResearch');
-const { sequenceSubjectTarget } = require('../lib/gemini');
+const { leadSummary, resolveLeadIdentity, sequenceSubjectTarget } = require('../lib/gemini');
 const { enqueueGeneration } = require('../workers/lead-research.worker');
 
 const NOW = new Date('2026-08-06T08:00:00.000Z');
@@ -86,6 +86,10 @@ test('Apollo normalization promotes LinkedIn and company domain fields', () => {
   assert.equal(lead.personalization_profile.company.linkedin_url, 'http://www.linkedin.com/company/acme');
 });
 
+test('Apollo normalization composes the canonical full name from matched name parts', () => {
+  assert.equal(normalizeApolloLead({ name: 'Robert', first_name: 'Robert', last_name: 'Salama' }).full_name, 'Robert Salama');
+});
+
 test('Apollo match profile patch promotes URLs without discarding existing research metadata', () => {
   const patch = buildApolloMatchProfilePatch({
     linkedin_url: '',
@@ -117,13 +121,47 @@ test('Apollo match profile patch promotes URLs without discarding existing resea
   });
 
   assert.equal(patch.linkedin_url, 'http://www.linkedin.com/in/jane-doe');
+  assert.equal(patch.first_name, 'Jane');
+  assert.equal(patch.last_name, 'Doe');
+  assert.equal(patch.full_name, 'Jane Doe');
   assert.equal(patch.company_domain, 'acme.example');
   assert.equal(patch.company_data.linkedin_url, 'http://www.linkedin.com/company/acme');
   assert.equal(patch.company_data.domain, 'acme.example');
   assert.equal(patch.personalization_profile.source, 'apify');
+  assert.equal(patch.personalization_profile.person.first_name, 'Jane');
+  assert.equal(patch.personalization_profile.person.last_name, 'Doe');
   assert.equal(patch.personalization_profile.person.linkedin_url, 'http://www.linkedin.com/in/jane-doe');
   assert.equal(patch.personalization_profile.company.linkedin_url, 'http://www.linkedin.com/company/acme');
   assert.equal(patch.personalization_profile.evidence[0].excerpt, 'Existing evidence');
+});
+
+test('email identity never uses an Apify company/person value over Apollo identity', () => {
+  const lead = {
+    full_name: 'Robert',
+    first_name: '',
+    last_name: '',
+    raw_data: {
+      apollo: {
+        searchPerson: { first_name: 'Robert' },
+        bulkMatch: { name: 'Robert Salama', first_name: 'Robert', last_name: 'Salama' },
+      },
+    },
+    personalization_profile: {
+      source: 'apify',
+      person: { first_name: 'Sequoia', headline: 'Company profile text' },
+    },
+  };
+  const identity = resolveLeadIdentity(lead);
+  const summary = leadSummary(lead);
+
+  assert.deepEqual(identity, {
+    full_name: 'Robert Salama',
+    first_name: 'Robert',
+    last_name: 'Salama',
+  });
+  assert.equal(summary.first_name, 'Robert');
+  assert.equal(summary.person.first_name, 'Robert');
+  assert.equal(summary.person.last_name, 'Salama');
 });
 
 test('research can use a verified business email domain when Apollo has no website URL', () => {
@@ -186,6 +224,36 @@ test('research normalization prioritizes recent public posts and keeps provenanc
   assert.equal(profile.evidence[0].source_url, 'https://www.linkedin.com/posts/jane-launch');
   assert.match(profile.evidence[0].excerpt, /dispatch workflow/);
   assert.equal(profile.person.recent_activity_type, 'regular');
+});
+
+test('research normalization keeps Apollo identity separate from a post author', () => {
+  const profile = normalizeResearch({
+    now: NOW,
+    lead: {
+      full_name: 'Robert',
+      first_name: '',
+      last_name: '',
+      title: 'Partner',
+      company_name: 'Sequoia',
+      raw_data: {
+        apollo: {
+          bulkMatch: { first_name: 'Robert', last_name: 'Salama', linkedin_url: 'https://www.linkedin.com/in/robert-salama' },
+        },
+      },
+    },
+    sourceResults: [{
+      kind: 'personPosts',
+      sourceUrl: 'https://www.linkedin.com/in/robert-salama',
+      items: [{
+        text: 'A company update',
+        author: { first_name: 'Sequoia', headline: 'Company profile text' },
+      }],
+    }],
+  });
+
+  assert.equal(profile.person.first_name, 'Robert');
+  assert.equal(profile.person.last_name, 'Salama');
+  assert.equal(profile.person.linkedin_url, 'https://www.linkedin.com/in/robert-salama');
 });
 
 test('research normalization falls back to explicit Apollo fields without inventing a hook', () => {
