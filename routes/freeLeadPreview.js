@@ -42,7 +42,7 @@ function allowIp(ip, now = Date.now()) {
 async function recentRequest(service, email, cutoff) {
   const { data, error } = await service
     .from('free_lead_preview_requests')
-    .select('id,status,created_at')
+    .select('id,status,ready_count,created_at')
     .eq('email', email)
     .gte('created_at', cutoff)
     .in('status', ['queued', 'searching', 'enriching', 'sending', 'sent', 'partial'])
@@ -76,7 +76,8 @@ router.post('/', async (req, res) => {
   try {
     const cutoff = new Date(Date.now() - EMAIL_COOLDOWN_MS).toISOString();
     const existing = await recentRequest(service, input.email, cutoff);
-    if (existing) {
+    const emptyPartial = existing?.status === 'partial' && Number(existing.ready_count || 0) === 0;
+    if (existing && !emptyPartial) {
       return res.status(409).json({
         ok: false,
         error: existing.status === 'sent' || existing.status === 'partial'

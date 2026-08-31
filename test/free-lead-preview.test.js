@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   appendUniquePreviewPeople,
+  buildPreviewMatchPatch,
   dedupePreviewPeople,
   hasEnoughPreviewResearch,
   isUsableWorkEmail,
@@ -87,7 +88,7 @@ test('preview fit scoring explains a complete audience match', () => {
   ]);
 });
 
-test('only researched individual work emails qualify for a preview report', () => {
+test('only verified individual work emails with core contact data qualify for a preview report', () => {
   assert.equal(isUsableWorkEmail('jane@acme.example'), true);
   assert.equal(isUsableWorkEmail('info@acme.example'), false);
   assert.equal(isUsableWorkEmail('jane@acme'), false);
@@ -101,7 +102,49 @@ test('only researched individual work emails qualify for a preview report', () =
   };
   assert.equal(hasEnoughPreviewResearch(lead), true);
   assert.equal(hasEnoughPreviewResearch({ ...lead, email: 'info@acme.example' }), false);
-  assert.equal(hasEnoughPreviewResearch({ ...lead, company_data: {} }), false);
+  assert.equal(hasEnoughPreviewResearch({ ...lead, company_data: {} }), true);
+  assert.equal(hasEnoughPreviewResearch({ ...lead, title: '' }), false);
+});
+
+test('a verified Apollo contact remains reportable when optional company enrichment is unavailable', () => {
+  assert.equal(hasEnoughPreviewResearch({
+    full_name: 'Jane Doe',
+    title: 'VP Sales',
+    company_name: 'Acme',
+    email: 'jane@acme.example',
+    company_data: {},
+    personalization_profile: {},
+  }), true);
+});
+
+test('preview stores Apollo bulk-match research before the waterfall email callback', () => {
+  const patch = buildPreviewMatchPatch({
+    full_name: 'Jane Doe',
+    company_name: 'Acme',
+    title: 'VP Sales',
+    company_data: {},
+    personalization_profile: {},
+    enrichment_data: {},
+  }, {
+    personId: 'person-1',
+    match: {
+      id: 'person-1',
+      first_name: 'Jane',
+      last_name: 'Doe',
+      title: 'VP Sales',
+      organization: {
+        name: 'Acme',
+        primary_domain: 'acme.example',
+        industry: 'B2B SaaS',
+      },
+    },
+    companyDomain: 'acme.example',
+  });
+
+  assert.equal(patch.company_domain, 'acme.example');
+  assert.equal(patch.company_data.domain, 'acme.example');
+  assert.equal(patch.personalization_profile.company.industry, 'B2B SaaS');
+  assert.equal(patch.enrichment_data.match.id, 'person-1');
 });
 
 test('branded preview email renders the same research sections as lead research', () => {
