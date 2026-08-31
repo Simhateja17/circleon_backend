@@ -13,6 +13,7 @@ const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
 const autopilotRoutes = require('./routes/autopilot');
+const freeLeadPreviewRoutes = require('./routes/freeLeadPreview');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
@@ -20,6 +21,7 @@ const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
 const { createWorker: createLeadImportWorker } = require('./workers/lead-import.worker');
 const { createWorker: createLeadResearchWorker } = require('./workers/lead-research.worker');
 const { createWorker: createAutopilotWorker } = require('./workers/autopilot.worker');
+const { createWorker: createFreeLeadPreviewWorker } = require('./workers/free-lead-preview.worker');
 const { startAutopilotScheduler } = require('./lib/autopilotScheduler');
 
 const app = express();
@@ -55,6 +57,7 @@ app.use('/api/calling', callingRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
 app.use('/api/autopilot', autopilotRoutes);
+app.use('/api/free-lead-preview', freeLeadPreviewRoutes);
 app.use('/api/billing', billingRoutes);
 
 app.get('/api/health', (_req, res) => {
@@ -98,6 +101,18 @@ app.listen(PORT, () => {
     } catch (error) {
       console.error('[autopilot-worker] failed to start', error.message);
     }
+  }
+  const runFreeLeadPreviewWorkerInProcess = process.env.FREE_LEAD_PREVIEW_WORKER_ENABLED === 'true'
+    || (process.env.FREE_LEAD_PREVIEW_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
+  if (runFreeLeadPreviewWorkerInProcess) {
+    try {
+      createFreeLeadPreviewWorker();
+      console.log('[free-lead-preview-worker] running in this process');
+    } catch (error) {
+      console.error('[free-lead-preview-worker] failed to start', error.message);
+    }
+  } else {
+    console.log('[free-lead-preview-worker] in-process worker disabled');
   }
   startCallingQueue();
   startAutopilotScheduler();

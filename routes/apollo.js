@@ -21,6 +21,7 @@ const {
   requestBulkEnrichment,
   searchPeople,
 } = require('../lib/apollo');
+const { applyFreeLeadPreviewWebhookUpdates } = require('../lib/freeLeadPreview');
 
 const router = express.Router();
 
@@ -509,7 +510,8 @@ router.post('/webhook', async (req, res) => {
 
     const updates = extractWebhookUpdates(req.body || {});
     const result = await applyApolloUpdates(service, updates);
-    return res.json(result);
+    const preview = await applyFreeLeadPreviewWebhookUpdates(service, updates);
+    return res.json({ ...result, preview });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to process Apollo webhook' });
   }
