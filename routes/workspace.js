@@ -31,7 +31,7 @@ function generateSystemPrompt(answers) {
     ? normalizedTitles.join(', ')
     : 'CEO, Founder, Director';
 
-  return `# Barsha Email Sales Agent
+  return `# CircleOn AI Email Sales Agent
 
 Company: ${getAnswer(answers, 'company', '[Company]')}
 Product or service: ${getAnswer(answers, 'product', '-')}

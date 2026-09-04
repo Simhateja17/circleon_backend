@@ -245,7 +245,7 @@ router.post('/conversations/:leadId/draft', async (req, res) => {
     if (!agentConfig) return res.status(400).json({ error: 'Agent configuration is required before drafting replies' });
 
     const latestInbound = [...history].reverse().find(message => message.direction === 'inbound');
-    if (!latestInbound) return res.status(400).json({ error: 'Barsha needs an inbound email before it can draft a reply' });
+    if (!latestInbound) return res.status(400).json({ error: 'CircleOn AI needs an inbound email before it can draft a reply' });
 
     const body = await draftReply({
       lead,

@@ -589,7 +589,7 @@ router.get('/imports/:runId/errors.csv', async (req, res) => {
     const csvCell = value => `"${String(value ?? '').replace(/"/g, '""')}"`;
     const body = ['row,reason', ...rejected.map(item => `${csvCell(item.row)},${csvCell(item.reason)}`)].join('\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="barsha-import-${data.id}-errors.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="circleon-import-${data.id}-errors.csv"`);
     return res.send(body);
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to download CSV import errors' });

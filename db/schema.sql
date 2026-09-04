@@ -1,4 +1,4 @@
--- CircleOnproduct MVP schema.
+-- CircleOn AI product MVP schema.
 -- Apply this in Supabase SQL editor before using the authenticated workspace APIs.
 
 create table if not exists public.workspaces (

@@ -1,5 +1,5 @@
 -- Apollo candidates without a verified work email are audit-only outcomes,
--- never durable Barsha leads.
+-- never durable CircleOn AI leads.
 
 create table if not exists public.apollo_enrichment_audits (
   id uuid primary key default gen_random_uuid(),

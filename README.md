@@ -1,4 +1,4 @@
-# Barsha Backend
+# CircleOn AI Backend
 
 ## Email OTP authentication
 
@@ -7,7 +7,7 @@ Email authentication is passwordless. The frontend requests and verifies a verif
 For hosted Supabase, configure **Authentication → Email Templates → Magic Link** to send a code rather than a link. The template must use `{{ .Token }}` and must not use `{{ .ConfirmationURL }}`. For example:
 
 ```html
-<h2>Your Barsha AI sign-in code</h2>
+<h2>Your CircleOn AI sign-in code</h2>
 <p>Enter this code to continue:</p>
 <p style="font-size: 24px; font-weight: 700; letter-spacing: 4px;">{{ .Token }}</p>
 <p>This code expires soon. If you did not request it, you can ignore this email.</p>
@@ -35,5 +35,5 @@ the requester. Preview records are separate from authenticated workspace leads;
 the flow does not contact the prospects.
 
 Apply `db/2026-08-30-free-lead-preview.sql`, set the `FREE_LEAD_PREVIEW_*`
-SMTP variables, and expose `/api/apollo/webhook` through `APOLLO_WEBHOOK_URL`.
+SMTP variables, and expose the lead-enrichment webhook at `/api/apollo/webhook` through `APOLLO_WEBHOOK_URL`.
 The production PM2 config runs the preview worker separately from the API.
