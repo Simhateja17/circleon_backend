@@ -1,12 +1,24 @@
 const express = require('express');
+const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { suggestTargetTerms } = require('../lib/gemini');
 const { getBilling, isActiveSubscription, requireActiveSubscription } = require('../lib/billing');
 const { ensureSuggestedCampaigns } = require('../lib/autopilot');
+const { applyTourPatch, normalizeTourState } = require('../lib/tourState');
 
 const router = express.Router();
 
 const PLAN_IDS = new Set(['atelier', 'maison', 'sovereign']);
+
+// Every field is optional: the client sends only what changed, and a failed
+// write must never be able to blank out the rest of the record.
+const tourPatchSchema = z.object({
+  status: z.enum(['not_started', 'in_progress', 'completed', 'skipped']).optional(),
+  lastStepId: z.string().min(1).max(80).nullable().optional(),
+  lastStepIndex: z.number().int().min(0).max(500).optional(),
+  seenStepIds: z.array(z.string().min(1).max(80)).max(200).optional(),
+  restart: z.boolean().optional(),
+});
 
 function getAnswer(answers, key, fallback = '') {
   const value = answers?.[key];
@@ -101,6 +113,39 @@ router.get('/me', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load workspace' });
+  }
+});
+
+router.get('/tour', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    return res.json({ tour: normalizeTourState(workspace.tour_state) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load tour progress' });
+  }
+});
+
+router.patch('/tour', async (req, res) => {
+  const parsed = tourPatchSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid tour progress update' });
+  }
+
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const tour = applyTourPatch(workspace.tour_state, parsed.data);
+
+    const { data, error } = await req.supabase
+      .from('workspaces')
+      .update({ tour_state: tour })
+      .eq('id', workspace.id)
+      .select('tour_state')
+      .single();
+
+    if (error) throw error;
+    return res.json({ tour: normalizeTourState(data.tour_state) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to save tour progress' });
   }
 });
 
