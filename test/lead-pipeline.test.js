@@ -23,6 +23,11 @@ test('CSV parser preserves quoted commas and mapping keeps raw columns', () => {
   assert.equal(mapped.raw_data.csv.Firm, 'Acme');
 });
 
+test('CSV parser rejects malformed quotes and duplicate headers', () => {
+  assert.throws(() => parseCsv('Name,Email\n"Jane,jane@example.com'), /unclosed quoted value/);
+  assert.throws(() => parseCsv('Email,email\na@b.com,a@b.com'), /duplicate column headers/);
+});
+
 test('usable email rejects generic mailboxes', () => {
   assert.equal(usableEmail('person@company.com'), true);
   assert.equal(usableEmail('info@company.com'), false);

@@ -527,6 +527,11 @@ router.post('/csv/import', async (req, res) => {
     const mappings = Array.isArray(req.body.mappings) ? req.body.mappings : [];
     const parsed = parseCsv(req.body.csv_text || '');
     if (!parsed.rows.length || !mappings.length) return res.status(400).json({ error: 'Confirmed CSV mapping is required' });
+    if (parsed.rows.length > 10000) return res.status(400).json({ error: 'CSV exceeds the 10,000-row limit' });
+    const allowedTargets = new Set(['full_name','first_name','last_name','company_name','title','email','phone','location','linkedin_url','company_domain','company_industry','company_size','external_id','ignore']);
+    if (mappings.some(item => !parsed.headers.includes(item?.source) || !allowedTargets.has(item?.target))) return res.status(400).json({ error: 'CSV mapping contains an unsupported column' });
+    const selectedTargets = mappings.filter(item => item.target !== 'ignore').map(item => item.target);
+    if (new Set(selectedTargets).size !== selectedTargets.length) return res.status(400).json({ error: 'Two CSV columns cannot map to the same field' });
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const { data, error } = await req.supabase.from('lead_import_runs').insert({
       workspace_id: workspace.id,
@@ -652,4 +657,6 @@ module.exports.calculateFitScore = calculateFitScore;
 module.exports.normalizeDomain = normalizeDomain;
 module.exports.usableEmail = usableEmail;
 module.exports.processCsvImport = processCsvImport;
+module.exports.getOrCreateWorkspace = getOrCreateWorkspace;
+module.exports.findExistingLead = findExistingLead;
 module.exports.assignLeadToCampaign = assignLeadToCampaign;

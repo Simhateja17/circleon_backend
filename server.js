@@ -14,6 +14,7 @@ const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
 const autopilotRoutes = require('./routes/autopilot');
 const freeLeadPreviewRoutes = require('./routes/freeLeadPreview');
+const documentRoutes = require('./routes/documents');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startCallingQueue } = require('./lib/callingQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
@@ -58,6 +59,7 @@ app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
 app.use('/api/autopilot', autopilotRoutes);
 app.use('/api/free-lead-preview', freeLeadPreviewRoutes);
+app.use('/api/documents', documentRoutes);
 app.use('/api/billing', billingRoutes);
 
 app.get('/api/health', (_req, res) => {
