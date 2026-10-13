@@ -6,21 +6,15 @@ const { getBilling, isActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
 
 const router = express.Router();
-const PLAN_IDS = new Set(['atelier', 'maison']);
+const monthly = require('../lib/monthlyBilling');
+const { byId, invoiceSubscription } = require('../lib/pricing');
+const PLAN_IDS = new Set(Object.keys(byId));
 
 function stripeClient() {
   if (!process.env.STRIPE_SECRET_KEY) throw new Error('Stripe is not configured. Set STRIPE_SECRET_KEY.');
   return new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2026-02-25.clover' });
 }
 
-function priceForPlan(plan) {
-  const prices = {
-    atelier: process.env.STRIPE_PRICE_ATELIER_ANNUAL,
-    maison: process.env.STRIPE_PRICE_MAISON_ANNUAL,
-  };
-  if (!prices[plan]) throw new Error(`Stripe price is not configured for ${plan}.`);
-  return prices[plan];
-}
 
 function appUrl(path) {
   const base = process.env.FRONTEND_URL;
@@ -36,6 +30,7 @@ async function upsertBilling(service, workspaceId, patch) {
 function buildCheckoutSessionPatch(session) {
   const patch = {
     stripe_checkout_session_id: session.id,
+    ...(session.metadata?.pricing_version === 'monthly_v3' ? {checkout_lock_until:null} : {}),
   };
 
   if (session.customer) patch.stripe_customer_id = String(session.customer);
@@ -64,16 +59,70 @@ async function workspaceIdForSubscription(service, subscription) {
 async function syncSubscription(service, subscription) {
   const workspaceId = await workspaceIdForSubscription(service, subscription);
   if (!workspaceId) return;
-  const periodEnd = subscription.items?.data?.[0]?.current_period_end || subscription.current_period_end;
-  await upsertBilling(service, workspaceId, {
-    stripe_customer_id: String(subscription.customer),
-    stripe_subscription_id: subscription.id,
-    plan: subscription.metadata?.plan || null,
-    subscription_status: subscription.status,
+  const item = subscription.items?.data?.find(item => item.price.recurring?.usage_type !== 'metered') || subscription.items?.data?.[0];
+  const periodEnd = item?.current_period_end || subscription.current_period_end;
+  const periodStart = item?.current_period_start || subscription.current_period_start;
+  const plan = subscription.metadata?.plan;
+  const existing = await monthly.result(service.from('workspace_billing').select('*').eq('workspace_id', workspaceId).maybeSingle());
+  const patch = {
+    stripe_customer_id: String(subscription.customer), stripe_subscription_id: subscription.id,
+    ...(plan ? { plan } : {}), subscription_status: subscription.status,
     current_period_end: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
     cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
-  });
+  };
+  if (byId[plan]) {
+    Object.assign(patch, {
+      current_period_start: periodStart ? new Date(periodStart * 1000).toISOString() : null,
+      trial_start: subscription.trial_start ? new Date(subscription.trial_start * 1000).toISOString() : null,
+      trial_end: subscription.trial_end ? new Date(subscription.trial_end * 1000).toISOString() : null,
+      founding: subscription.metadata?.founding === 'true',
+      ...(subscription.metadata?.setup_in_checkout==='true'?{setup_charged:true}:{}),
+    });
+    if (subscription.status === 'active') patch.payment_failed = false;
+    if (existing?.pending_plan === plan) patch.pending_plan = null;
+    // A ready flag can only be set by internal admin, never by subscription metadata.
+    if (byId[plan].family === 'allinone' && subscription.status === 'trialing' && !existing?.voice_ready && subscription.cancel_at !== subscription.trial_end) {
+      await stripeClient().subscriptions.update(subscription.id, { cancel_at: subscription.trial_end });
+    }
+  }
+  await upsertBilling(service, workspaceId, patch);
+  if (plan) await monthly.result(service.from('workspaces').update({ plan }).eq('id', workspaceId));
+  if (!byId[plan]) return;
+  if (subscription.status === 'canceled') {
+    await monthly.result(service.from('founding_reservations').update({ state: 'released' }).eq('workspace_id', workspaceId).eq('state', 'reserved'));
+  }
+  if (subscription.trial_start && subscription.metadata.trial_domain) {
+    await monthly.result(service.from('company_trials').update({ consumed: true }).eq('workspace_id', workspaceId).eq('domain', subscription.metadata.trial_domain));
+  }
+  if (subscription.status === 'trialing' && subscription.metadata.trial_domain) {
+    await monthly.result(service.from('founding_reservations').update({ expires_at: new Date(subscription.trial_end * 1000 + 48 * 3600000).toISOString() }).eq('workspace_id', workspaceId).eq('state', 'reserved'));
+  }
+  if (patch.founding && ['active','trialing'].includes(subscription.status) && !(byId[plan].family==='allinone' && subscription.status==='trialing' && !existing?.voice_ready)) {
+    const until = await monthly.configureFounderSchedule(stripeClient(), subscription, { ...existing, ...patch, workspace_id: workspaceId }, byId[plan], existing?.pending_plan !== plan ? byId[existing?.pending_plan] : null);
+    if (until && !existing?.founder_until) await upsertBilling(service, workspaceId, { founder_until: until });
+  }
+
 }
+
+router.get('/catalog', async (_req, res) => {
+  try { res.set('Cache-Control', 'no-store'); return res.json(await monthly.publicCatalog()); }
+  catch (error) { return res.status(503).json({ error: 'Pricing availability could not be loaded.' }); }
+});
+
+const demoBuckets = new Map();
+router.post('/demo', async (req, res) => {
+  const key = req.ip; const now = Date.now(); const previous = demoBuckets.get(key) || 0;
+  if (now - previous < 60000) return res.status(429).json({ error: 'Please wait a minute before sending another request.' });
+  const { name, email, company, message } = req.body || {};
+  if (![name,email,company].every(v => typeof v === 'string' && v.trim() && v.length <= 250) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || String(message || '').length > 2000) return res.status(400).json({ error: 'Enter your name, company, and valid email.' });
+  try {
+    await monthly.result(monthly.service().from('demo_requests').insert({ name: name.trim(), email: email.trim().toLowerCase(), company: company.trim(), message: message || null }));
+    demoBuckets.set(key, now); if (demoBuckets.size > 10000) demoBuckets.clear();
+    return res.status(201).json({ received: true });
+  } catch (error) { return res.status(500).json({ error: 'Could not save your demo request. Please try again.' }); }
+});
+
+router.post('/inbound/:id', express.urlencoded({extended:false}), (req,res,next)=>require('../lib/inboundBilling').handleInbound(req,res).catch(next));
 
 router.use(requireAuth);
 
@@ -81,7 +130,7 @@ router.get('/status', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
     const billing = await getBilling(req.supabase, workspace.id);
-    return res.json({ billing, active: isActiveSubscription(billing) });
+    return res.json({ billing, active: isActiveSubscription(billing), usage: billing ? await monthly.usage(req.supabase, billing) : null });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load billing status.' });
   }
@@ -89,51 +138,24 @@ router.get('/status', async (req, res) => {
 
 router.post('/checkout', async (req, res) => {
   try {
-    const plan = req.body?.plan;
-    if (!PLAN_IDS.has(plan)) return res.status(400).json({ error: 'Select Atelier or Maison to continue to checkout.' });
+    if (!PLAN_IDS.has(req.body?.plan)) return res.status(400).json({ error: 'Select a current monthly plan.' });
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
-    const existing = await getBilling(req.supabase, workspace.id);
-    if (isActiveSubscription(existing)) return res.status(409).json({ error: 'This workspace already has an active subscription.' });
-
-    const stripe = stripeClient();
-    let customerId = existing?.stripe_customer_id || null;
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: req.user.email || undefined,
-        name: workspace.name,
-        metadata: { workspace_id: workspace.id, owner_id: req.user.id },
-      });
-      customerId = customer.id;
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer: customerId,
-      line_items: [{ price: priceForPlan(plan), quantity: 1 }],
-      success_url: appUrl('/plan-select?checkout=success&session_id={CHECKOUT_SESSION_ID}'),
-      cancel_url: appUrl('/plan-select?checkout=cancelled'),
-      allow_promotion_codes: false,
-      metadata: { workspace_id: workspace.id, plan },
-      subscription_data: { metadata: { workspace_id: workspace.id, plan } },
-    });
-
-    const service = createServiceClient();
-    if (!service) throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for Stripe billing.');
-    await upsertBilling(service, workspace.id, { stripe_customer_id: customerId, stripe_checkout_session_id: session.id, plan, subscription_status: 'pending' });
-    const { error: planError } = await service.from('workspaces').update({ plan }).eq('id', workspace.id);
-    if (planError) throw planError;
-    return res.json({ url: session.url });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || 'Could not start Stripe Checkout.' });
-  }
+    if (workspace.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the owner manages billing.' });
+    const checkout = await monthly.startMonthlyCheckout({ db: monthly.service(), stripe: stripeClient(), workspace, user: req.user, planId: req.body.plan, appUrl, startPaid: req.body.start_paid === true });
+    return res.json(checkout);
+  } catch (error) { return res.status(error.status || 409).json({ error: error.message || 'Could not start checkout.' }); }
 });
 
 router.post('/portal', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    if (workspace.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the owner manages billing.' });
     const billing = await getBilling(req.supabase, workspace.id);
     if (!billing?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer exists for this workspace yet.' });
-    const session = await stripeClient().billingPortal.sessions.create({ customer: billing.stripe_customer_id, return_url: appUrl('/dashboard?page=billing') });
+    const configuration = byId[billing.plan] ? process.env.STRIPE_MONTHLY_PORTAL_CONFIGURATION_ID : undefined;
+    if (byId[billing.plan] && !configuration) return res.status(503).json({ error: 'Monthly billing portal configuration is required.' });
+    if (configuration) require('../lib/billingConfiguration').assertMonthlyPortal(await stripeClient().billingPortal.configurations.retrieve(configuration));
+    const session = await stripeClient().billingPortal.sessions.create({ customer: billing.stripe_customer_id, return_url: appUrl('/dashboard?page=billing'), ...(configuration ? { configuration } : {}) });
     return res.json({ url: session.url });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Could not open the Stripe Billing Portal.' });
@@ -150,13 +172,13 @@ async function handleWebhook(req, res) {
 
   const service = createServiceClient();
   if (!service) return res.status(500).send('SUPABASE_SERVICE_ROLE_KEY is required for Stripe webhooks.');
-  const { data: recorded, error: eventError } = await service.from('stripe_webhook_events').upsert(
+  const { error: eventError } = await service.from('stripe_webhook_events').upsert(
     { event_id: event.id, event_type: event.type }, { onConflict: 'event_id', ignoreDuplicates: true }
   ).select('processed_at').maybeSingle();
   if (eventError) return res.status(500).send(eventError.message);
-  if (!recorded || recorded.processed_at) return res.status(200).json({ received: true });
-
   try {
+    const recorded = await monthly.result(service.from('stripe_webhook_events').select('processed_at').eq('event_id', event.id).single());
+    if (recorded?.processed_at) return res.status(200).json({ received: true });
     const object = event.data.object;
     if (event.type === 'checkout.session.completed') {
       const workspaceId = object.metadata?.workspace_id;
@@ -171,16 +193,35 @@ async function handleWebhook(req, res) {
         }
       }
     } else if (event.type.startsWith('customer.subscription.')) {
-      await syncSubscription(service, object);
+      // Refresh current Stripe state so late events cannot restore canceled access.
+      await syncSubscription(service, await stripeClient().subscriptions.retrieve(object.id));
+    } else if (event.type === 'invoice.created') {
+      await monthly.billClosedUsage(service, stripeClient(), object);
+    } else if (event.type === 'checkout.session.expired') {
+      const wid=object.metadata?.workspace_id;
+      if(wid){const current=await monthly.result(service.from('workspace_billing').select('stripe_checkout_session_id').eq('workspace_id',wid).maybeSingle());if(current?.stripe_checkout_session_id===object.id)await monthly.result(service.from('founding_reservations').update({state:'released'}).eq('workspace_id',wid).eq('state','reserved'));}
     } else if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
-      const subscriptionId = object.subscription;
-      if (subscriptionId) await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(subscriptionId)));
+      const subscriptionId = invoiceSubscription(object);
+      if (subscriptionId) {
+        const subscription = await stripeClient().subscriptions.retrieve(String(subscriptionId));
+        await syncSubscription(service, subscription);
+        const wid = await workspaceIdForSubscription(service, subscription);
+        if (wid && byId[subscription.metadata?.plan]) {
+          if (event.type === 'invoice.payment_failed' && (await stripeClient().invoices.retrieve(object.id)).status !== 'paid') {
+            await upsertBilling(service, wid, { payment_failed: true });
+            await monthly.notify(service, wid, `failed:${object.id}`, 'Payment failed', 'Activity is paused. Update your payment method in Billing.');
+          } else if (event.type === 'invoice.paid' && object.amount_paid > 0) {
+            await upsertBilling(service, wid, { payment_failed: false });
+            await monthly.result(service.from('founding_reservations').update({ state: 'confirmed', expires_at: null }).eq('workspace_id', wid).eq('state', 'reserved'));
+          }
+        }
+      }
     } else if (event.type === 'invoice_payment.paid') {
       const invoiceId = typeof object.invoice === 'string' ? object.invoice : object.invoice?.id;
       if (invoiceId) {
         const invoice = await stripeClient().invoices.retrieve(String(invoiceId));
-        if (invoice.subscription) {
-          await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(invoice.subscription)));
+        if (invoiceSubscription(invoice)) {
+          await syncSubscription(service, await stripeClient().subscriptions.retrieve(String(invoiceSubscription(invoice))));
         }
       }
     }
@@ -192,4 +233,6 @@ async function handleWebhook(req, res) {
   }
 }
 
-module.exports = { router, handleWebhook, buildCheckoutSessionPatch };
+router.use('/provider-credits', require('./providerCredits'));
+router.use(require('./monthlyBilling'));
+module.exports = { router, handleWebhook, buildCheckoutSessionPatch, syncSubscription };

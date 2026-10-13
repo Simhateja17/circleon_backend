@@ -151,8 +151,13 @@ async function processSendJob(job) {
     }
   }
 
+  const monthly = require('../lib/monthlyBilling');
+  const usageKey = 'email:' + message.id;
+  const reservation = await monthly.consumeUsage(service,campaign.workspace_id,'emails',1,usageKey);
+  if(reservation?.duplicate) return {skipped:true,reason:'Email delivery already reserved; inspect before retrying'};
   const transport = createTransport(account);
-  const sent = await sendEmail({
+  let sent;
+  try { sent = await sendEmail({
     transport,
     from: fromHeader(account),
     to: lead.email,
@@ -163,7 +168,10 @@ async function processSendJob(job) {
     inReplyTo: isInboxReply ? message.in_reply_to_header : undefined,
     references: isInboxReply ? message.in_reply_to_header : undefined,
     attachments,
-  });
+  }); } catch(error) {
+    await service.rpc('release_email_usage',{wid:campaign.workspace_id,usage_key:usageKey});
+    throw error;
+  }
 
   const { error } = await service
     .from('messages')

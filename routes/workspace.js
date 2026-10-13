@@ -60,32 +60,7 @@ Likely timing signal: ${answerWithCustom(answers, 'timingSignal', '-')}
 Write concise, truthful, personalized B2B emails. Use only supplied lead and company facts. Respect opt-outs immediately. Never invent praise, customer results, or urgency. Tone: ${answerWithCustom(answers, 'tone', 'Professional')}. Booking link: ${answerWithCustom(answers, 'calLink', '[Not set]')}.`;
 }
 
-async function getOrCreateWorkspace(supabase, user) {
-  const { data: existing, error: selectError } = await supabase
-    .from('workspaces')
-    .select('*')
-    .eq('owner_id', user.id)
-    .maybeSingle();
-
-  if (selectError) throw selectError;
-  if (existing) return existing;
-
-  const fallbackName = user.user_metadata?.business_name
-    || user.email?.split('@')[0]
-    || 'My Workspace';
-
-  const { data, error } = await supabase
-    .from('workspaces')
-    .insert({
-      owner_id: user.id,
-      name: fallbackName,
-    })
-    .select('*')
-    .single();
-
-  if (error) throw error;
-  return data;
-}
+const { getOrCreateWorkspace } = require('../lib/workspace');
 
 router.use(requireAuth);
 

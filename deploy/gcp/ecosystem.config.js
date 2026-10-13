@@ -1,6 +1,19 @@
 module.exports = {
   apps: [
     {
+      name: 'barsha-billing-worker',
+      script: './workers/billing.worker.js',
+      cwd: '/opt/barsha-backend',
+      instances: 1,
+      exec_mode: 'fork',
+      env: { NODE_ENV: 'production' },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 10000,
+      time: true,
+    },
+    {
       name: 'barsha-backend',
       script: './server.js',
       cwd: '/opt/barsha-backend',

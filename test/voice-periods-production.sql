@@ -1,0 +1,30 @@
+-- Actual schema; all data rolls back.
+begin;
+do $$ declare owner uuid:=gen_random_uuid();wid uuid:=gen_random_uuid();cid uuid:=gen_random_uuid();old_start timestamptz:=date_trunc('second',now())-interval '1 month';boundary timestamptz:=date_trunc('second',now());rows_n integer;amount_n integer;charge uuid;
+begin
+ insert into auth.users(id,email)values(owner,'pricing-'||owner||'@example.invalid');
+ insert into workspaces(id,owner_id)values(wid,owner);
+ insert into workspace_billing(workspace_id,plan,subscription_status,current_period_start,current_period_end,voice_ready)values(wid,'voice_starter','active',old_start,boundary,true);
+ insert into calls(id,workspace_id,status)values(cid,wid,'queued');
+ update workspace_billing set current_period_start=boundary,current_period_end=boundary+interval '1 month' where workspace_id=wid;
+ update calls set status='completed',duration_seconds=60.5,started_at=boundary-interval '30.25 seconds',ended_at=boundary+interval '30.25 seconds' where id=cid;
+ perform record_voice_period_usage(wid,cid,jsonb_build_array(jsonb_build_object('period_start',old_start,'seconds',30.25),jsonb_build_object('period_start',boundary,'seconds',30.25)));
+ perform record_voice_period_usage(wid,cid,jsonb_build_array(jsonb_build_object('period_start',old_start,'seconds',30.25),jsonb_build_object('period_start',boundary,'seconds',30.25)));
+ select count(*) into rows_n from billing_usage where workspace_id=wid and voice_seconds=30.25;
+ if rows_n<>2 then raise exception 'Split duration or idempotency failed';end if;
+ update billing_usage set voice_seconds=6000.5 where workspace_id=wid and period_start=old_start;
+ select id,amount into charge,amount_n from claim_usage_invoice(wid,boundary,'in_test1');
+ if amount_n<>60 then raise exception 'Expected exactly one monthly overage minute';end if;
+ perform commit_usage_invoice_charge(charge);perform commit_usage_invoice_charge(charge);
+ select count(*) into rows_n from claim_usage_invoice(wid,boundary,'in_test1');
+ if rows_n<>0 then raise exception 'Already invoiced usage charged again';end if;
+ update billing_usage set voice_seconds=6060.5 where workspace_id=wid and period_start=old_start;
+ select id,amount into charge,amount_n from claim_usage_invoice(wid,boundary,'in_test2');
+ if amount_n<>60 then raise exception 'Late usage must charge only additional minute';end if;
+ select count(*) into rows_n from claim_usage_invoice(wid,boundary,'in_test3');
+ if rows_n<>0 then raise exception 'Pending invoice amount double claimed';end if;
+ perform commit_usage_invoice_charge(charge);
+ if (select billed_voice_cents from billing_usage where workspace_id=wid and period_start=old_start)<>120 then raise exception 'Wrong invoiced amount';end if;
+end $$;
+select 'PASS: split-period fractional seconds, call retry, invoice retry and late-only delta' result;
+rollback;

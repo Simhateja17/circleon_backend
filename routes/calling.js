@@ -1,4 +1,5 @@
 const express = require('express');
+const {monthlyWorkspace,loadWorkspaceAgent}=require('../lib/voiceAgentProvisioning');
 const requireAuth = require('../middleware/auth');
 const { getOrCreateWorkspace } = require('../lib/workspace');
 const {
@@ -21,7 +22,7 @@ async function getWorkspaceBundle(supabase, user) {
   ] = await Promise.all([
     supabase.from('agent_configs').select('*').eq('workspace_id', workspace.id).maybeSingle(),
     supabase.from('workspace_telephony').select('*').eq('workspace_id', workspace.id).maybeSingle(),
-    supabase.from('voice_agents').select('*').eq('workspace_id', workspace.id).maybeSingle(),
+    monthlyWorkspace(supabase,workspace.id).then(async monthly=>monthly?{data:await loadWorkspaceAgent(supabase,workspace.id)}:await supabase.from('voice_agents').select('*').eq('workspace_id',workspace.id).is('campaign_id',null).eq('shared_scope',false).maybeSingle()),
     supabase
       .from('ai_jobs')
       .select('*')
@@ -117,33 +118,17 @@ router.get('/status', async (req, res) => {
   }
 });
 
-router.post('/telephony', async (req, res) => {
-  try {
-    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
-    const fromNumber = normalizePhone(req.body.from_number || req.body.retell_phone_number);
-
-    if (!fromNumber) {
-      return res.status(400).json({ error: 'A dedicated workspace phone number is required' });
-    }
-
-    const { data, error } = await req.supabase
-      .from('workspace_telephony')
-      .upsert({
-        workspace_id: workspace.id,
-        from_number: fromNumber,
-        retell_phone_number: fromNumber,
-        phone_number_status: 'attached',
-        launch_notes: req.body.launch_notes || null,
-        last_error: null,
-      }, { onConflict: 'workspace_id' })
-      .select('*')
-      .single();
-
-    if (error) throw error;
-    return res.json({ workspaceTelephony: data });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || 'Failed to attach telephony' });
-  }
+// Superseded by POST /api/voice/telephony.
+//
+// This endpoint recorded whatever number it was given and marked it "attached"
+// without ever contacting Retell, so a call placed afterwards failed at dial
+// time. Attaching a number now requires the customer's Twilio SIP trunk details
+// and is confirmed against Retell before it counts as verified.
+router.post('/telephony', (req, res) => {
+  return res.status(410).json({
+    error: 'Attach your Singapore number through the voice settings so we can verify it with the calling provider',
+    moved_to: '/api/voice/telephony',
+  });
 });
 
 router.post('/provision-agent', async (req, res) => {

@@ -2,6 +2,7 @@ const express = require('express');
 const { createServiceClient } = require('../lib/supabase');
 const { verifyRetellSignature } = require('../lib/calling');
 const { extractOutcome, upsertCallOutcome } = require('../lib/outcomes');
+const { handleVoiceCallCompletion } = require('../lib/voiceCallCompletion');
 
 const router = express.Router();
 
@@ -100,7 +101,7 @@ router.post('/', async (req, res) => {
   if (call.end_timestamp || call.end_time) {
     patch.ended_at = new Date(call.end_timestamp || call.end_time).toISOString();
   }
-  if (call.duration_ms) patch.duration_seconds = Math.round(Number(call.duration_ms) / 1000);
+  if (call.duration_ms) patch.duration_seconds = Number(call.duration_ms) / 1000;
   if (call.duration_seconds) patch.duration_seconds = Number(call.duration_seconds);
   if (call.transcript) patch.transcript = call.transcript;
   if (call.recording_url) patch.recording_url = call.recording_url;
@@ -118,6 +119,13 @@ router.post('/', async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   const updatedCall = updatedCalls?.[0];
 
+  // Billing must acknowledge completion durably even before analysis arrives.
+  // Return a retryable failure if metering fails; follow-up side effects run later.
+  if (updatedCall?.status === 'completed') {
+    try { await require('../lib/callCredits').chargeForCall(supabase, updatedCall); }
+    catch (billingError) { return res.status(500).json({error:'Call usage could not be recorded.'}); }
+  }
+
   if (updatedCall?.follow_up_id && ['completed', 'failed', 'no_answer', 'busy', 'canceled'].includes(patch.status)) {
     await supabase
       .from('follow_ups')
@@ -132,7 +140,21 @@ router.post('/', async (req, res) => {
   if (updatedCall && (['completed', 'call_analyzed', 'analyzed'].includes(eventName) || patch.summary)) {
     const outcome = extractOutcome(call, patch.status);
     await upsertCallOutcome(supabase, updatedCall, outcome, call);
-    await createSuggestedFollowUp(supabase, updatedCall, call);
+
+    if (updatedCall.campaign_id) {
+      // A voice campaign call: charge the credit, schedule or stop the retry,
+      // honour a do-not-call request, and send the email the agent promised.
+      try {
+        await handleVoiceCallCompletion(supabase, { call: updatedCall, outcome, payload: call });
+      } catch (completionError) {
+        // The call itself is already recorded. Losing the follow-up work should
+        // not make Retell retry the whole webhook.
+        console.error('[retell-webhook] voice completion failed', updatedCall.id, completionError);
+      }
+    } else {
+      await require('../lib/callCredits').chargeForCall(supabase,updatedCall);
+      await createSuggestedFollowUp(supabase, updatedCall, call);
+    }
   }
 
   return res.json({ received: true });

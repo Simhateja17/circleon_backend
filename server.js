@@ -9,6 +9,9 @@ const campaignRoutes = require('./routes/campaigns');
 const emailRoutes = require('./routes/emails');
 const inboxRoutes = require('./routes/inbox');
 const callingRoutes = require('./routes/calling');
+const voiceRoutes = require('./routes/voice');
+const voiceAgentRoutes = require('./routes/voiceAgent');
+const calendarOAuthRoutes = require('./routes/calendarOAuth');
 const aiRoutes = require('./routes/ai');
 const retellWebhookRoutes = require('./routes/retellWebhook');
 const outcomeRoutes = require('./routes/outcomes');
@@ -16,7 +19,7 @@ const autopilotRoutes = require('./routes/autopilot');
 const freeLeadPreviewRoutes = require('./routes/freeLeadPreview');
 const documentRoutes = require('./routes/documents');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
-const { startCallingQueue } = require('./lib/callingQueue');
+const { startVoiceQueue } = require('./lib/voiceCampaignQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
 const { apiErrorHandler, apiRequestLogger } = require('./lib/logger');
 const { createWorker: createLeadImportWorker } = require('./workers/lead-import.worker');
@@ -55,6 +58,11 @@ app.use('/api/campaigns', campaignRoutes);
 app.use('/api/emails', emailRoutes);
 app.use('/api/inbox', inboxRoutes);
 app.use('/api/calling', callingRoutes);
+// The agent's own endpoints are called by Retell mid-call, not the browser, so
+// they mount before the session-authenticated voice router.
+app.use('/api/voice/agent', voiceAgentRoutes);
+app.use('/api/voice', voiceRoutes);
+app.use('/api/calendar/google', calendarOAuthRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/outcomes', outcomeRoutes);
 app.use('/api/autopilot', autopilotRoutes);
@@ -116,7 +124,7 @@ app.listen(PORT, () => {
   } else {
     console.log('[free-lead-preview-worker] in-process worker disabled');
   }
-  startCallingQueue();
+  startVoiceQueue();
   startAutopilotScheduler();
   resumeQueuedAgentLaunchJobs().catch(error => {
     console.error('[agent-launch-recovery] failed', error);

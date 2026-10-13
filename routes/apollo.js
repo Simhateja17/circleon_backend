@@ -814,6 +814,15 @@ router.post('/import', async (req, res) => {
     if (!await requireActiveSubscription(req, res, workspace)) return;
     const agentConfig = await getAgentConfig(req.supabase, workspace.id);
     const filters = normalizeFilters(req.body.filters || req.body, agentConfig || {});
+    const billing = await require('../lib/billing').getBilling(req.supabase,workspace.id);
+    const plan = require('../lib/pricing').limits(billing);
+    if(plan) {
+      if(!plan.leads) return res.status(403).json({error:'Lead finding is not included on Voice Agent.'});
+      const usage = await require('../lib/monthlyBilling').usage(req.supabase,billing);
+      const remaining=plan.leads+(plan.trial?0:Math.floor(billing.lead_overage_cap_cents/100))-usage.used.leads;
+      if(remaining<=0) return res.status(402).json({error:'Lead allowance reached. Enable paid overage or upgrade.'});
+      filters.limit=Math.min(filters.limit,remaining);
+    }
     debug('import_start', {
       workspaceId: workspace.id,
       titles: filters.titles,

@@ -10,7 +10,11 @@
     "worker:poll-inbox": "node workers/poll-inbox.worker.js",
     "worker:lead-import": "node workers/lead-import.worker.js",
     "worker:lead-research": "node workers/lead-research.worker.js",
-    "worker:autopilot": "node workers/autopilot.worker.js"
+    "worker:autopilot": "node workers/autopilot.worker.js",
+    "worker:billing": "node workers/billing.worker.js",
+    "billing:configure-prices": "node scripts/configure-monthly-prices.js",
+    "billing:configure-portal": "node scripts/configure-monthly-portal.js",
+    "billing:check": "node scripts/check-monthly-readiness.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

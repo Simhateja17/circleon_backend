@@ -13,6 +13,7 @@ const { getOrCreateWorkspace } = require('../lib/workspace');
 const { requireActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
 const { scheduleMessages } = require('../lib/campaignScheduling');
+const { launchVoiceCampaign } = require('../lib/voiceLaunch');
 
 const router = express.Router();
 
@@ -145,7 +146,12 @@ const campaignBriefSchema = z.object({
 
 const campaignSchema = z.object({
   name: z.string().trim().min(1).max(120),
+  channel: z.enum(['email', 'voice']).default('email'),
   lead_source: z.enum(['apollo', 'csv', 'manual']).default('manual'),
+  // Voice only. Three attempts a business day apart is the default; the queue
+  // varies the time of day between them.
+  max_call_attempts: z.number().int().min(1).max(10).default(3),
+  retry_gap_hours: z.number().int().min(1).max(336).default(24),
   import_run_id: z.string().uuid().nullable().optional(),
   sending_hours_start: z.string().regex(/^\d{2}:\d{2}$/).default('09:00'),
   sending_hours_end: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
@@ -161,6 +167,15 @@ const campaignLeadSchema = z.object({
 });
 
 const campaignUpdateSchema = campaignSchema.partial().omit({ import_run_id: true, lead_source: true });
+
+// The brief records the language as a human word ("English", "Mandarin"); the
+// voice agent needs a locale.
+function voiceLanguageFromBrief(brief = {}) {
+  const language = String(brief?.language || 'English').toLowerCase();
+  if (language.includes('mandarin') || language.includes('chinese') || language.startsWith('zh')) return 'zh-CN';
+  if (language.includes('british')) return 'en-GB';
+  return 'en-US';
+}
 
 function campaignBrief(agentConfig, brief = {}) {
   return {
@@ -345,7 +360,6 @@ router.post('/', async (req, res) => {
         brief: campaignBrief(agentConfig, payload.brief),
         import_run_id: payload.import_run_id || null,
         workspace_id: workspace.id,
-        channel: 'email',
         status: 'draft',
         created_by: req.user.id,
       })
@@ -354,7 +368,20 @@ router.post('/', async (req, res) => {
 
     if (error) throw error;
 
-    await createDefaultSequence(req, campaign.id);
+    if (campaign.channel === 'voice') {
+      // A voice campaign starts with an empty script rather than a sequence.
+      // The language comes from the brief so the builder opens on the right one.
+      const { error: scriptError } = await req.supabase
+        .from('voice_scripts')
+        .insert({
+          workspace_id: workspace.id,
+          campaign_id: campaign.id,
+          language: voiceLanguageFromBrief(payload.brief),
+        });
+      if (scriptError) throw scriptError;
+    } else {
+      await createDefaultSequence(req, campaign.id);
+    }
     const savedCampaign = await loadCampaign(req, workspace.id, campaign.id);
 
     return res.status(201).json({ campaign: savedCampaign });
@@ -981,18 +1008,6 @@ router.post('/:campaignId/launch', async (req, res) => {
 
     if (!await requireActiveSubscription(req, res, workspace)) return;
 
-    const { data: account, error: accountError } = await req.supabase
-      .from('connected_accounts')
-      .select('id, status, smtp_verified_at, imap_verified_at')
-      .eq('workspace_id', workspace.id)
-      .eq('provider', 'smtp')
-      .maybeSingle();
-
-    if (accountError) throw accountError;
-    if (!account || account.status !== 'connected' || !account.smtp_verified_at || !account.imap_verified_at) {
-      return res.status(400).json({ error: 'Connect and verify both SMTP and IMAP before launching a campaign' });
-    }
-
     const { data: campaign, error: campaignError } = await req.supabase
       .from('campaigns')
       .select('*')
@@ -1004,6 +1019,22 @@ router.post('/:campaignId/launch', async (req, res) => {
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
     if (!['draft', 'paused'].includes(campaign.status)) {
       return res.status(400).json({ error: 'Only draft or paused campaigns can be launched' });
+    }
+
+    if (campaign.channel === 'voice') {
+      return launchVoiceCampaign(req, res, { workspace, campaign });
+    }
+
+    const { data: account, error: accountError } = await req.supabase
+      .from('connected_accounts')
+      .select('id, status, smtp_verified_at, imap_verified_at')
+      .eq('workspace_id', workspace.id)
+      .eq('provider', 'smtp')
+      .maybeSingle();
+
+    if (accountError) throw accountError;
+    if (!account || account.status !== 'connected' || !account.smtp_verified_at || !account.imap_verified_at) {
+      return res.status(400).json({ error: 'Connect and verify both SMTP and IMAP before launching a campaign' });
     }
 
     const { data: messages, error: messageError } = await req.supabase
