@@ -85,6 +85,7 @@ router.get('/me', async (req, res) => {
       agentConfig,
       billing,
       subscriptionActive: isActiveSubscription(billing),
+      suspended: Boolean(billing?.suspended_at),
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to load workspace' });

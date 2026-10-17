@@ -233,6 +233,5 @@ async function handleWebhook(req, res) {
   }
 }
 
-router.use('/provider-credits', require('./providerCredits'));
 router.use(require('./monthlyBilling'));
 module.exports = { router, handleWebhook, buildCheckoutSessionPatch, syncSubscription };

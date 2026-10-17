@@ -1,10 +1,8 @@
 const express = require('express');
-const requireAuth = require('../middleware/auth');
 const {createServiceClient} = require('../lib/supabase');
-const {fetchApolloCredits,manualSnapshot,isInternalAdmin} = require('../lib/providerCredits');
+const {fetchApolloCredits,manualSnapshot} = require('../lib/providerCredits');
 const router = express.Router();
-router.use(requireAuth);
-router.use((req,res,next)=>isInternalAdmin(req.user)?next():res.status(403).json({error:'Internal CircleOn access only.'}));
+// Mounted under /api/admin, which enforces the founder allowlist and MFA.
 const wrap = fn => async(req,res)=>{try{await fn(req,res);}catch(error){res.status(400).json({error:error.message||'Credit monitoring request failed.'});}};
 function service(){const db=createServiceClient();if(!db)throw new Error('Service database access is not configured.');return db;}
 async function result(query){const {data,error}=await query;if(error)throw error;return data;}

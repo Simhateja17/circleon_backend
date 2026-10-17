@@ -6,41 +6,6 @@ const { byId } = require('../lib/pricing');
 const router = express.Router();
 const wrap = fn => async (req, res) => { try { await fn(req, res); } catch (error) { res.status(error.status || 400).json({ error: error.message || 'Billing request failed.' }); } };
 async function owner(req) { const w = await getOrCreateWorkspace(req.supabase, req.user); if (w.owner_id !== req.user.id) throw Object.assign(new Error('Only the workspace owner manages billing and teammates.'), { status: 403 }); return w; }
-function internal(req, res, next) {
-  const ids = (process.env.CIRCLEON_ADMIN_USER_IDS || '').split(',').map(v => v.trim()).filter(Boolean);
-  if (!ids.includes(req.user.id)) return res.status(403).json({ error: 'Internal CircleOn access only.' });
-  return next();
-}
-router.get('/admin', internal, wrap(async (req, res) => {
-  const db = m.service();
-  const [settings, customers, demos] = await Promise.all([
-    m.settings(db), m.result(db.from('workspaces').select('id,name,workspace_billing(*)').order('created_at', { ascending: false }).limit(200)),
-    m.result(db.from('demo_requests').select('*').order('created_at', { ascending: false }).limit(100)),
-  ]);
-  res.json({settings,customers:customers.map(w=>({...((Array.isArray(w.workspace_billing)?w.workspace_billing[0]:w.workspace_billing)||{}),workspace_id:w.id,workspaces:{name:w.name}})),demos});
-}));
-router.patch('/admin/settings', internal, wrap(async (req, res) => {
-  const patch = {};
-  for (const key of ['founding_offer_active','gst_registered','legal_ready','pdpa_verified','dnc_verified']) if (typeof req.body[key] === 'boolean') patch[key] = req.body[key];
-  if ('demo_url' in req.body) { if (req.body.demo_url && !/^https:\/\//.test(req.body.demo_url)) throw new Error('Use an HTTPS booking URL.'); patch.demo_url = req.body.demo_url || null; }
-  await m.result(m.service().from('pricing_settings').update(patch).eq('id', true)); res.json({ saved: true });
-}));
-router.patch('/admin/customers/:id', internal, wrap(async (req, res) => {
-  const db = m.service(), patch = {};
-  for (const key of ['trial_approved','voice_approved','voice_ready']) if (typeof req.body[key] === 'boolean') patch[key] = req.body[key];
-  if ('fallback_number' in req.body) { if (!/^\+[1-9]\d{7,14}$/.test(req.body.fallback_number)) throw new Error('Enter a fallback number in international format.'); patch.fallback_number = req.body.fallback_number; }
-  if ('company_trial_key' in req.body) { if(!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(req.body.company_trial_key)) throw new Error('Identify the approved company by its actual domain.'); patch.company_trial_key=req.body.company_trial_key; }
-  const b = await m.result(db.from('workspace_billing').select('*').eq('workspace_id', req.params.id).maybeSingle());
-  if(patch.trial_approved && !(patch.company_trial_key || b?.company_trial_key)) throw new Error('Save the actual company domain before approving a personal-email trial.');
-  if (patch.voice_ready && !(patch.fallback_number || b?.fallback_number)) throw new Error('Set an inbound fallback number before marking voice ready.');
-  if (patch.voice_ready && b?.subscription_status === 'trialing' && byId[b.plan]?.family === 'allinone') {
-    await m.stripeClient().subscriptions.update(b.stripe_subscription_id, { cancel_at: '' });
-    if(b.founding)await m.configureFounderSchedule(m.stripeClient(),await m.stripeClient().subscriptions.retrieve(b.stripe_subscription_id),{...b,voice_ready:true});
-  }
-  if(patch.voice_ready===false && b?.subscription_status==='trialing' && byId[b.plan]?.family==='allinone'){const stripe=m.stripeClient(),sub=await stripe.subscriptions.retrieve(b.stripe_subscription_id);if(sub.schedule)await stripe.subscriptionSchedules.release(typeof sub.schedule==='string'?sub.schedule:sub.schedule.id);await stripe.subscriptions.update(sub.id,{cancel_at:sub.trial_end});}
-  await m.result(db.from('workspace_billing').upsert({ workspace_id: req.params.id, ...patch }, { onConflict: 'workspace_id' }));
-  res.json({ saved: true });
-}));
 router.post('/extension-consent', wrap(async (req, res) => {
   const w = await owner(req), b = await getBilling(req.supabase, w.id);
   if (byId[b?.plan]?.family !== 'allinone' || b.subscription_status !== 'trialing' || b.trial_extended || b.voice_ready) throw new Error('This trial is not eligible for an extension.');
