@@ -33,7 +33,10 @@ const { startAutopilotScheduler } = require('./lib/autopilotScheduler');
 const app = express();
 const PORT = process.env.PORT || 5001;
 const frontendOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
-const allowedOrigins = [frontendOrigin, 'http://localhost:3000', 'http://localhost:3001'];
+// FRONTEND_URL stays a single URL because it builds links; extra sites that may
+// call the API (www, Vercel previews) go in the comma-separated CORS_ORIGINS.
+const extraOrigins = (process.env.CORS_ORIGINS || '').split(',').map(v => v.trim().replace(/\/+$/, '')).filter(Boolean);
+const allowedOrigins = [...new Set([frontendOrigin.replace(/\/+$/, ''), ...extraOrigins, 'http://localhost:3000', 'http://localhost:3001'])];
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(apiRequestLogger);
