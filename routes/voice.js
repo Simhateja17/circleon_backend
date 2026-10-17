@@ -3,9 +3,10 @@ const crypto = require('node:crypto');
 const { z } = require('zod');
 const requireAuth = require('../middleware/auth');
 const { getOrCreateWorkspace } = require('../lib/workspace');
-const { encrypt } = require('../lib/crypto');
+const { encrypt, decrypt } = require('../lib/crypto');
 const { normalizePhone } = require('../lib/calling');
 const {
+  deletePhoneNumber,
   getPhoneNumber,
   importPhoneNumber,
   listVoices,
@@ -24,6 +25,13 @@ const { syncVoiceAgent, monthlyWorkspace, loadWorkspaceAgent } = require('../lib
 const { createServiceClient } = require('../lib/supabase');
 const { voiceCampaignState, requiresAttestation, ACTIVE_CALL_STATUSES } = require('../lib/voiceCampaign');
 const { callingWindowState } = require('../lib/voiceScheduling');
+const {
+  ensureTerminationTrunk,
+  fetchOwnedNumber,
+  listEligibleNumbers,
+  routeInboundToWebhook,
+  validateAccount,
+} = require('../lib/twilioByok');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -108,48 +116,264 @@ router.get('/credits', async (req, res) => {
 // Telephony
 // ---------------------------------------------------------------------------
 
-const telephonySchema = z.object({
-  from_number: z.string().trim().min(5).max(20),
-  // Retell reaches a customer-owned +65 number through their Twilio Elastic SIP
-  // Trunk. API credentials alone are not enough; we need the trunk's
-  // termination URI.
-  termination_uri: z.string().trim().min(3).max(200),
-  sip_username: z.string().trim().max(120).optional(),
-  sip_password: z.string().trim().max(200).optional(),
-  twilio_account_sid: z.string().trim().max(64).optional(),
-});
+// The Retell registration only proves Retell accepted the number. It is not
+// proof of ownership, carrier routing, regulatory approval or a working call,
+// so a registered number is "attached"; "verified" is set by an operator after
+// real test calls.
+const SECRET_COLUMNS = ['twilio_auth_token_encrypted', 'sip_auth_password_encrypted', 'pdpc_api_key_encrypted'];
+
+function publicTelephony(data) {
+  if (!data) return null;
+  const telephony = { ...data };
+  for (const column of SECRET_COLUMNS) delete telephony[column];
+  telephony.pdpc_configured = Boolean(data.pdpc_account_id && data.pdpc_api_key_encrypted);
+  telephony.twilio_connected = Boolean(data.twilio_account_sid && data.twilio_auth_token_encrypted && data.twilio_connected_at);
+  return telephony;
+}
+
+async function ownerWorkspace(req, res) {
+  const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+  if (workspace.owner_id !== req.user.id) {
+    res.status(403).json({ error: 'Only the workspace owner manages the calling number.' });
+    return null;
+  }
+  return workspace;
+}
+
+async function loadTelephony(req, workspaceId) {
+  const { data, error } = await req.supabase
+    .from('workspace_telephony')
+    .select('*')
+    .eq('workspace_id', workspaceId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+function storedTwilio(telephony) {
+  if (!telephony?.twilio_account_sid || !telephony?.twilio_auth_token_encrypted || !telephony?.twilio_connected_at) return null;
+  return { accountSid: telephony.twilio_account_sid, authToken: decrypt(telephony.twilio_auth_token_encrypted) };
+}
+
+function sendError(res, error, fallback) {
+  const status = error.status && error.status < 600 ? error.status : 500;
+  return res.status(status).json({ error: error.message || fallback });
+}
+
+/** Another workspace already using this number would make inbound ambiguous. */
+async function numberInUseElsewhere(fromNumber, workspaceId) {
+  const { data, error } = await createServiceClient()
+    .from('workspace_telephony')
+    .select('workspace_id')
+    .eq('from_number', fromNumber)
+    .neq('workspace_id', workspaceId)
+    .in('phone_number_status', ['attached', 'verified'])
+    .limit(1);
+  if (error) throw error;
+  return Boolean(data?.length);
+}
+
+/** Import into Retell, replacing a stale registration this workspace owns. */
+async function registerWithRetell({ fromNumber, terminationUri, sipUsername, sipPassword, nickname }) {
+  const options = { phoneNumber: fromNumber, terminationUri, sipUsername, sipPassword, nickname };
+  try {
+    await importPhoneNumber(options);
+  } catch (error) {
+    const existing = await getPhoneNumber(fromNumber).catch(() => null);
+    if (!existing) throw error;
+    await deletePhoneNumber(fromNumber);
+    await importPhoneNumber(options);
+  }
+  await getPhoneNumber(fromNumber);
+}
 
 router.get('/telephony', async (req, res) => {
   try {
     const workspace = await getOrCreateWorkspace(req.supabase, req.user);
-    const { data, error } = await req.supabase
-      .from('workspace_telephony')
-      .select('*')
-      .eq('workspace_id', workspace.id)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    // Never return secrets to the browser.
-    const telephony = data ? { ...data } : null;
-    if (telephony) {
-      delete telephony.twilio_auth_token_encrypted;
-      delete telephony.pdpc_api_key_encrypted;
-      telephony.pdpc_configured = Boolean(data.pdpc_account_id && data.pdpc_api_key_encrypted);
-    }
-
-    return res.json({ telephony });
+    const telephony = await loadTelephony(req, workspace.id);
+    return res.json({ telephony: publicTelephony(telephony), is_owner: workspace.owner_id === req.user.id });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Could not load telephony settings' });
   }
 });
 
+const twilioAccountSchema = z.object({
+  account_sid: z.string().trim().max(64),
+  auth_token: z.string().trim().max(64),
+});
+
+/** Connect the customer's own Twilio account. The token is validated before it is stored. */
+router.post('/telephony/twilio', async (req, res) => {
+  try {
+    const parsed = twilioAccountSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Enter your Twilio Account SID and Auth Token.' });
+
+    const workspace = await ownerWorkspace(req, res);
+    if (!workspace) return;
+
+    const credentials = { accountSid: parsed.data.account_sid, authToken: parsed.data.auth_token };
+    const account = await validateAccount(credentials);
+    const current = await loadTelephony(req, workspace.id);
+
+    // A different account invalidates the number, trunk and Retell registration.
+    const switching = current?.twilio_account_sid && current.twilio_account_sid !== credentials.accountSid;
+    const patch = {
+      workspace_id: workspace.id,
+      twilio_account_sid: credentials.accountSid,
+      twilio_auth_token_encrypted: encrypt(credentials.authToken),
+      twilio_connected_at: new Date().toISOString(),
+      twilio_connected_by: req.user.id,
+      last_error: null,
+      ...(switching ? {
+        phone_number_status: 'missing',
+        twilio_phone_number_sid: null,
+        twilio_trunk_sid: null,
+        twilio_credential_list_sid: null,
+        sip_auth_username: null,
+        sip_auth_password_encrypted: null,
+        termination_uri: null,
+        retell_registered_at: null,
+      } : {}),
+    };
+
+    const { data, error } = await req.supabase
+      .from('workspace_telephony')
+      .upsert(patch, { onConflict: 'workspace_id' })
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    return res.json({ telephony: publicTelephony(data), account: { friendly_name: account.friendlyName, type: account.type } });
+  } catch (error) {
+    return sendError(res, error, 'Could not connect the Twilio account');
+  }
+});
+
+/** Singapore voice numbers owned by the connected Twilio account. */
+router.get('/telephony/twilio/numbers', async (req, res) => {
+  try {
+    const workspace = await ownerWorkspace(req, res);
+    if (!workspace) return;
+    const credentials = storedTwilio(await loadTelephony(req, workspace.id));
+    if (!credentials) return res.status(409).json({ error: 'Connect your Twilio account first.' });
+    return res.json({ numbers: await listEligibleNumbers(credentials) });
+  } catch (error) {
+    return sendError(res, error, 'Could not load your Twilio numbers');
+  }
+});
+
+const twilioNumberSchema = z.object({ phone_number_sid: z.string().trim().max(64) });
+
 /**
- * Attach a customer-owned Singapore number.
- *
- * The previous version of this endpoint accepted any string and marked the
- * number "attached" without ever contacting Retell, so a call would fail at
- * dial time. Attachment now means Retell has the number.
+ * Connect one number from the customer's Twilio account: prove ownership
+ * through their credentials, configure termination and inbound routing on
+ * their account, then register the number with Retell.
+ */
+router.post('/telephony/twilio/number', async (req, res) => {
+  let workspace;
+  try {
+    const parsed = twilioNumberSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Choose a number from your Twilio account.' });
+
+    workspace = await ownerWorkspace(req, res);
+    if (!workspace) return;
+
+    const publicUrl = process.env.API_PUBLIC_URL;
+    if (!publicUrl || !process.env.RETELL_API_KEY) {
+      return res.status(503).json({ error: 'Voice calling is not configured on this server yet.' });
+    }
+
+    const telephony = await loadTelephony(req, workspace.id);
+    const credentials = storedTwilio(telephony);
+    if (!credentials) return res.status(409).json({ error: 'Connect your Twilio account first.' });
+
+    const number = await fetchOwnedNumber(credentials, parsed.data.phone_number_sid);
+    const fromNumber = normalizePhone(number.phone_number);
+    if (await numberInUseElsewhere(fromNumber, workspace.id)) {
+      return res.status(409).json({ error: 'This number is already connected to another CircleOn workspace.' });
+    }
+
+    await req.supabase
+      .from('workspace_telephony')
+      .update({
+        from_number: fromNumber,
+        twilio_phone_number_sid: number.sid,
+        phone_number_status: 'pending_verification',
+        last_error: null,
+      })
+      .eq('workspace_id', workspace.id);
+
+    const trunk = await ensureTerminationTrunk(credentials, {
+      workspaceId: workspace.id,
+      existing: {
+        trunkSid: telephony.twilio_trunk_sid,
+        credentialListSid: telephony.twilio_credential_list_sid,
+        sipUsername: telephony.sip_auth_username,
+        sipPassword: telephony.sip_auth_password_encrypted ? decrypt(telephony.sip_auth_password_encrypted) : null,
+        terminationUri: telephony.termination_uri,
+      },
+    });
+
+    // Store the trunk before anything else can fail so a retry reuses it.
+    await req.supabase
+      .from('workspace_telephony')
+      .update({
+        twilio_trunk_sid: trunk.trunkSid,
+        twilio_credential_list_sid: trunk.credentialListSid,
+        sip_auth_username: trunk.sipUsername,
+        sip_auth_password_encrypted: encrypt(trunk.sipPassword),
+        termination_uri: trunk.terminationUri,
+      })
+      .eq('workspace_id', workspace.id);
+
+    await routeInboundToWebhook(credentials, number.sid, `${publicUrl.replace(/\/$/, '')}/api/billing/inbound/${workspace.id}`);
+    await registerWithRetell({
+      fromNumber,
+      terminationUri: trunk.terminationUri,
+      sipUsername: trunk.sipUsername,
+      sipPassword: trunk.sipPassword,
+      nickname: workspace.name,
+    });
+
+    const now = new Date().toISOString();
+    const { data, error } = await req.supabase
+      .from('workspace_telephony')
+      .update({
+        retell_phone_number: fromNumber,
+        phone_number_status: 'attached',
+        number_imported_at: now,
+        retell_registered_at: now,
+        last_error: null,
+      })
+      .eq('workspace_id', workspace.id)
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    return res.json({ telephony: publicTelephony(data), registered: true });
+  } catch (error) {
+    if (workspace) {
+      await req.supabase
+        .from('workspace_telephony')
+        .update({ phone_number_status: 'error', last_error: error.message || 'Could not connect the number' })
+        .eq('workspace_id', workspace.id);
+    }
+    return sendError(res, error, 'Could not connect the number');
+  }
+});
+
+const telephonySchema = z.object({
+  from_number: z.string().trim().min(5).max(20),
+  // Manual path for a trunk the customer configured themselves.
+  termination_uri: z.string().trim().min(3).max(200),
+  sip_username: z.string().trim().max(120).optional(),
+  sip_password: z.string().trim().max(200).optional(),
+});
+
+/**
+ * Attach a number through a SIP trunk the customer configured by hand. It
+ * cannot prove ownership, and inbound needs the webhook set manually, so the
+ * Twilio account flow above is the default.
  */
 router.post('/telephony', async (req, res) => {
   try {
@@ -158,12 +382,16 @@ router.post('/telephony', async (req, res) => {
       return res.status(400).json({ error: 'Invalid telephony payload', details: parsed.error.flatten() });
     }
 
-    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    const workspace = await ownerWorkspace(req, res);
+    if (!workspace) return;
     const payload = parsed.data;
     const fromNumber = normalizePhone(payload.from_number);
 
     if (!fromNumber.startsWith('+65')) {
       return res.status(400).json({ error: 'Calling numbers must be Singapore (+65) numbers' });
+    }
+    if (await numberInUseElsewhere(fromNumber, workspace.id)) {
+      return res.status(409).json({ error: 'This number is already connected to another CircleOn workspace.' });
     }
 
     await req.supabase
@@ -172,29 +400,29 @@ router.post('/telephony', async (req, res) => {
         workspace_id: workspace.id,
         from_number: fromNumber,
         phone_number_status: 'pending_verification',
-        twilio_account_sid: payload.twilio_account_sid || null,
         last_error: null,
       }, { onConflict: 'workspace_id' });
 
     try {
-      await importPhoneNumber({
-        phoneNumber: fromNumber,
+      await registerWithRetell({
+        fromNumber,
         terminationUri: payload.termination_uri,
         sipUsername: payload.sip_username,
         sipPassword: payload.sip_password,
         nickname: workspace.name,
       });
 
-      // Confirm the number really is registered before calling it verified.
-      await getPhoneNumber(fromNumber);
-
+      const now = new Date().toISOString();
       const { data, error } = await req.supabase
         .from('workspace_telephony')
         .update({
           retell_phone_number: fromNumber,
-          phone_number_status: 'verified',
-          number_imported_at: new Date().toISOString(),
-          twilio_auth_token_encrypted: payload.sip_password ? encrypt(payload.sip_password) : null,
+          phone_number_status: 'attached',
+          number_imported_at: now,
+          retell_registered_at: now,
+          termination_uri: payload.termination_uri,
+          sip_auth_username: payload.sip_username || null,
+          sip_auth_password_encrypted: payload.sip_password ? encrypt(payload.sip_password) : null,
           last_error: null,
         })
         .eq('workspace_id', workspace.id)
@@ -202,12 +430,7 @@ router.post('/telephony', async (req, res) => {
         .single();
 
       if (error) throw error;
-
-      const telephony = { ...data };
-      delete telephony.twilio_auth_token_encrypted;
-      delete telephony.pdpc_api_key_encrypted;
-
-      return res.json({ telephony, verified: true });
+      return res.json({ telephony: publicTelephony(data), registered: true });
     } catch (importError) {
       const message = importError.message || 'Retell could not accept this number';
       await req.supabase
@@ -688,6 +911,7 @@ router.get('/campaigns/:campaignId/state', async (req, res) => {
 
     const { campaign, script, agent, telephony } = context;
     const now = new Date();
+    const monthly = await monthlyWorkspace(req.supabase, workspace.id);
 
     const [
       credits,
@@ -738,7 +962,8 @@ router.get('/campaigns/:campaignId/state', async (req, res) => {
       telephony,
       callsToday: undefined,
       activeCalls: activeCalls || 0,
-      creditBalanceCents: credits.balance_cents,
+      // Monthly plans are governed by allowance and caps in the queue, not prepaid credit.
+      creditBalanceCents: monthly ? undefined : credits.balance_cents,
       pendingTargets: duePending,
       nextAttemptAt: nextRetry?.next_attempt_at || null,
     }, now);
@@ -762,6 +987,7 @@ router.get('/campaigns/:campaignId/state', async (req, res) => {
       },
       next_attempt_at: nextRetry?.next_attempt_at || null,
       credits: { balance_cents: credits.balance_cents, spent_on_campaign_cents: spentCents },
+      monthly,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Could not load campaign state' });

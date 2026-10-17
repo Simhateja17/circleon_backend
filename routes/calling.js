@@ -40,6 +40,13 @@ async function getWorkspaceBundle(supabase, user) {
   return { workspace, agentConfig, telephony, voiceAgent, latestLaunchJob: launchJobs?.[0] || null };
 }
 
+// Encrypted credentials never leave the server, even as ciphertext.
+function withoutSecrets(telephony) {
+  if (!telephony) return telephony;
+  const { twilio_auth_token_encrypted, sip_auth_password_encrypted, pdpc_api_key_encrypted, ...rest } = telephony;
+  return rest;
+}
+
 function readiness({ workspace, agentConfig, telephony, voiceAgent }) {
   const checks = [
     { key: 'plan', label: 'Plan selected', ready: Boolean(workspace?.plan), reason: workspace?.plan ? null : 'Select a plan first' },
@@ -101,7 +108,7 @@ router.get('/status', async (req, res) => {
     if (callsError) throw callsError;
 
     return res.json({
-      workspaceTelephony: bundle.telephony,
+      workspaceTelephony: withoutSecrets(bundle.telephony),
       voiceAgent: bundle.voiceAgent,
       latestLaunchJob: bundle.latestLaunchJob,
       readiness: readiness(bundle),
@@ -185,7 +192,7 @@ router.post('/launch', async (req, res) => {
       .single();
 
     if (error) throw error;
-    return res.json({ workspaceTelephony: data, readiness: readiness({ ...bundle, telephony: data }) });
+    return res.json({ workspaceTelephony: withoutSecrets(data), readiness: readiness({ ...bundle, telephony: data }) });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to update launch status' });
   }
