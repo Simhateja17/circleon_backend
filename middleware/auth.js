@@ -24,6 +24,7 @@ async function requireAuth(req, res, next) {
   }
 
   let supabase = createRequestClient(token);
+  let accessToken = token;
   let { data, error } = await supabase.auth.getUser();
 
   if ((error || !data.user) && cookies[REFRESH_COOKIE]) {
@@ -34,7 +35,8 @@ async function requireAuth(req, res, next) {
 
     if (!refreshResult.error && refreshResult.data.session) {
       setSessionCookies(res, refreshResult.data.session);
-      supabase = createRequestClient(refreshResult.data.session.access_token);
+      accessToken = refreshResult.data.session.access_token;
+      supabase = createRequestClient(accessToken);
       ({ data, error } = await supabase.auth.getUser());
     }
   }
@@ -52,6 +54,8 @@ async function requireAuth(req, res, next) {
 
   req.user = data.user;
   req.supabase = supabase;
+  // Admin MFA calls GoTrue directly and needs the token this request was verified with.
+  req.accessToken = accessToken;
   return next();
 }
 

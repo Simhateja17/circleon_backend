@@ -18,6 +18,8 @@ const outcomeRoutes = require('./routes/outcomes');
 const autopilotRoutes = require('./routes/autopilot');
 const freeLeadPreviewRoutes = require('./routes/freeLeadPreview');
 const documentRoutes = require('./routes/documents');
+const adminRoutes = require('./routes/admin');
+const supportRoutes = require('./routes/support');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startVoiceQueue } = require('./lib/voiceCampaignQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
@@ -69,6 +71,8 @@ app.use('/api/autopilot', autopilotRoutes);
 app.use('/api/free-lead-preview', freeLeadPreviewRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/billing', billingRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/support', supportRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
