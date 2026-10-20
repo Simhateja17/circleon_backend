@@ -31,6 +31,8 @@ const { createWorker: createFreeLeadPreviewWorker } = require('./workers/free-le
 const { startAutopilotScheduler } = require('./lib/autopilotScheduler');
 
 const app = express();
+// One reverse proxy sits in front of Node, so req.ip should come from X-Forwarded-For.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5001;
 const frontendOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
 // FRONTEND_URL stays a single URL because it builds links; extra sites that may
