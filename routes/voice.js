@@ -18,7 +18,7 @@ const {
   requiresDncCheck,
   summariseCallability,
 } = require('../lib/dnc');
-const { getCredits } = require('../lib/callCredits');
+const { creditCheck, getCredits } = require('../lib/callCredits');
 const { authorizationUrl } = require('../lib/googleCalendar');
 const { generateVoiceScript, composeOpeningLine } = require('../lib/voiceScript');
 const { syncVoiceAgent, monthlyWorkspace, loadWorkspaceAgent } = require('../lib/voiceAgentProvisioning');
@@ -987,6 +987,8 @@ router.get('/campaigns/:campaignId/state', async (req, res) => {
       },
       next_attempt_at: nextRetry?.next_attempt_at || null,
       credits: { balance_cents: credits.balance_cents, spent_on_campaign_cents: spentCents },
+      // The queue skips calls silently when this is not ok, so the page has to say why.
+      calling_allowed: await creditCheck(req.supabase, workspace.id).then(({ ok, reason }) => ({ ok, reason })).catch(() => ({ ok: true, reason: null })),
       monthly,
     });
   } catch (error) {

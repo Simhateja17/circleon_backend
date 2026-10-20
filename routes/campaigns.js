@@ -14,6 +14,7 @@ const { requireActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
 const { scheduleMessages } = require('../lib/campaignScheduling');
 const { launchVoiceCampaign } = require('../lib/voiceLaunch');
+const { requestPhoneReveal } = require('../lib/apollo');
 
 const router = express.Router();
 
@@ -452,7 +453,7 @@ router.put('/:campaignId/leads', async (req, res) => {
     if (requestedIds.length) {
       const { data, error } = await req.supabase
         .from('leads')
-        .select('id, email, lifecycle_status, dnc_status')
+        .select('id, email, lifecycle_status, dnc_status, phone, phone_e164, external_id, source')
         .eq('workspace_id', workspace.id)
         .in('id', requestedIds);
       if (error) throw error;
@@ -495,7 +496,20 @@ router.put('/:campaignId/leads', async (req, res) => {
       if (lifecycleError) throw lifecycleError;
     }
     await restoreUnassignedLeadLifecycle(req, workspace.id, removedIds);
-    return res.json({ lead_ids: requestedIds });
+    // Apollo leads arrive with emails only. Ask for phones now that they are in
+    // a voice campaign; numbers land through the enrichment webhook.
+    let phoneLookups = 0;
+    if (campaign.channel === 'voice') {
+      const missing = leads.filter(lead => !lead.phone && !lead.phone_e164 && lead.external_id && lead.source === 'apollo');
+      if (missing.length) {
+        try {
+          phoneLookups = (await requestPhoneReveal(missing.map(lead => lead.external_id))).requested;
+        } catch (error) {
+          console.error('[campaigns] phone reveal failed', error.message);
+        }
+      }
+    }
+    return res.json({ lead_ids: requestedIds, phone_lookups: phoneLookups });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to update campaign leads' });
   }
