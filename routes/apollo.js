@@ -375,6 +375,10 @@ async function applyApolloUpdates(supabase, updates) {
     }
     if (item.phone) patch.phone = item.phone;
     if (item.phone_e164) patch.phone_e164 = item.phone_e164;
+    if (item.phone && item.phone_type) {
+      patch.phone_type = item.phone_type;
+      patch.phone_type_source = item.phone_type_source || null;
+    }
 
     const { error: updateError } = await supabase
       .from('leads')

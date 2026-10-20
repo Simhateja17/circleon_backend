@@ -1,6 +1,7 @@
 const express = require('express');
 const requireAuth = require('../middleware/auth');
 const { normalizePhone } = require('../lib/calling');
+const { refinePhoneTypeFromNumber } = require('../lib/dnc');
 const { createServiceClient } = require('../lib/supabase');
 const { mapCsvColumns } = require('../lib/gemini');
 const { applyMapping, parseCsv } = require('../lib/csvLeads');
@@ -72,6 +73,10 @@ function calculateFitScore(lead, agentConfig = {}) {
 
 function normalizeLead(input = {}) {
   const email = normalizeEmail(input.email);
+  const phoneE164 = normalizePhone(input.phone_e164 || input.phone);
+  // CSV and manual leads carry no hint about the line type, but Singapore
+  // numbers do: 8/9 are mobiles, 6 is a fixed line. DNC checks depend on it.
+  const inferredType = phoneE164 && !clean(input.phone_type) ? refinePhoneTypeFromNumber('unknown', phoneE164) : null;
   const source = clean(input.source);
   const userProvidedEmail = Boolean(email && source !== 'apollo');
   return {
@@ -82,7 +87,9 @@ function normalizeLead(input = {}) {
     company_name: clean(input.company_name || input.company),
     title: clean(input.title),
     phone: clean(input.phone),
-    phone_e164: normalizePhone(input.phone_e164 || input.phone),
+    phone_e164: phoneE164,
+    phone_type: clean(input.phone_type) || (inferredType && inferredType !== 'unknown' ? inferredType : undefined),
+    phone_type_source: clean(input.phone_type_source) || (inferredType && inferredType !== 'unknown' ? 'inferred_from_number' : undefined),
     email,
     email_status: clean(input.email_status) || (userProvidedEmail ? 'user_provided' : (email ? 'unverified' : 'unknown')),
     email_source: clean(input.email_source) || (email ? (source || 'manual') : null),

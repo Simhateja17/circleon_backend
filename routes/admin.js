@@ -5,6 +5,7 @@ const { byId } = require('../lib/pricing');
 const { setSessionCookies } = require('../lib/authCookies');
 const { audit, gotrue, mfaState, rateLimit, requireAdminMfa, requireFounder, result, service, totpFactors } = require('../lib/admin');
 const { sendSupportReplyEmail } = require('../lib/support');
+const { addCredits, getCredits } = require('../lib/callCredits');
 
 const router = express.Router();
 const PAGE_SIZE = 25;
@@ -92,7 +93,7 @@ router.get('/organizations/:id', wrap(async (req, res) => {
   const workspace = await result(db.from('workspaces').select('*').eq('id', id).maybeSingle());
   if (!workspace) throw Object.assign(new Error('Organization not found.'), { status: 404 });
   const count = table => db.from(table).select('id', { count: 'exact', head: true }).eq('workspace_id', id);
-  const [billing, members, campaigns, leads, sent, tickets, history, usage] = await Promise.all([
+  const [billing, members, campaigns, leads, sent, tickets, history, usage, telephony, credits] = await Promise.all([
     result(db.from('workspace_billing').select('*').eq('workspace_id', id).maybeSingle()),
     result(db.from('workspace_members').select('user_id,role,status,created_at').eq('workspace_id', id)).catch(() => []),
     result(db.from('campaigns').select('id,name,status,created_at').eq('workspace_id', id).order('created_at', { ascending: false }).limit(50)),
@@ -101,6 +102,8 @@ router.get('/organizations/:id', wrap(async (req, res) => {
     result(db.from('support_tickets').select('id,subject,status,last_message_at').eq('workspace_id', id).order('last_message_at', { ascending: false }).limit(20)),
     result(db.from('admin_audit_log').select('id,action,before,after,created_at').eq('target_id', id).order('created_at', { ascending: false }).limit(20)),
     result(db.from('billing_usage').select('*').eq('workspace_id', id).order('period_start', { ascending: false }).limit(3)),
+    result(db.from('workspace_telephony').select('from_number,phone_number_status,last_error').eq('workspace_id', id).maybeSingle()),
+    getCredits(db, id).catch(() => ({ balance_cents: 0 })),
   ]);
   const emails = await ownerEmails(db, [workspace.owner_id, ...members.map(x => x.user_id)]);
   res.json({
@@ -110,7 +113,33 @@ router.get('/organizations/:id', wrap(async (req, res) => {
     campaigns,
     counts: { leads: leads.count || 0, emails_sent: sent.count || 0 },
     usage, tickets, history,
+    telephony,
+    call_credits: { balance_cents: credits.balance_cents },
   });
+}));
+
+// Legacy-plan workspaces pay for calls from prepaid credit, and there is no
+// self-serve purchase yet, so staff grant it here.
+router.post('/organizations/:id/call-credits', wrap(async (req, res) => {
+  const db = service(), id = req.params.id;
+  const cents = Math.round(Number(req.body.amount_sgd) * 100), note = String(req.body.note || '').trim();
+  if (!Number.isFinite(cents) || cents === 0 || Math.abs(cents) > 100000) throw new Error('Enter an amount between -S$1,000 and S$1,000.');
+  if (note.length < 5) throw new Error('Give a note of at least 5 characters.');
+  const before = await getCredits(db, id);
+  await audit(req, db, { action: 'call_credits.adjust', targetType: 'workspace', targetId: id, before: { balance_cents: before.balance_cents }, after: { delta_cents: cents, note } });
+  const balance = await addCredits(db, id, cents, 'adjustment', note);
+  res.json({ balance_cents: balance });
+}));
+
+// A registered number stays "attached" until someone confirms a real call
+// worked; there was no way to record that outside the database.
+router.post('/organizations/:id/telephony/verify', wrap(async (req, res) => {
+  const db = service(), id = req.params.id;
+  const before = await result(db.from('workspace_telephony').select('phone_number_status,from_number').eq('workspace_id', id).maybeSingle());
+  if (!before || before.phone_number_status !== 'attached') throw new Error('Only a registered number waiting for its test call can be marked verified.');
+  await audit(req, db, { action: 'telephony.verify', targetType: 'workspace', targetId: id, before, after: { phone_number_status: 'verified' } });
+  await result(db.from('workspace_telephony').update({ phone_number_status: 'verified', last_error: null }).eq('workspace_id', id));
+  res.json({ saved: true });
 }));
 
 async function requireConfirmation(db, id, confirm) {
