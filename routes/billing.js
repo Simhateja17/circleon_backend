@@ -136,6 +136,37 @@ router.get('/status', async (req, res) => {
   }
 });
 
+// Read-only summary for the Billing screen: recent invoices and the card on file.
+// Only the fields the page renders are returned, never raw Stripe objects.
+router.get('/invoices', async (req, res) => {
+  try {
+    const workspace = await getOrCreateWorkspace(req.supabase, req.user);
+    if (workspace.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the owner manages billing.' });
+    const billing = await getBilling(req.supabase, workspace.id);
+    if (!billing?.stripe_customer_id) return res.json({ invoices: [], payment_method: null });
+    const stripe = stripeClient();
+    const [list, methods] = await Promise.all([
+      stripe.invoices.list({ customer: billing.stripe_customer_id, limit: 12 }),
+      stripe.paymentMethods.list({ customer: billing.stripe_customer_id, type: 'card', limit: 1 }),
+    ]);
+    const card = methods.data[0]?.card;
+    return res.json({
+      invoices: list.data.filter(invoice => invoice.status !== 'draft').map(invoice => ({
+        id: invoice.id,
+        date: invoice.created ? new Date(invoice.created * 1000).toISOString() : null,
+        description: invoice.lines?.data?.[0]?.description || invoice.description || 'Subscription',
+        amount_cents: invoice.total,
+        currency: invoice.currency,
+        status: invoice.status,
+        pdf_url: invoice.invoice_pdf || null,
+      })),
+      payment_method: card ? { brand: card.brand, last4: card.last4, exp_month: card.exp_month, exp_year: card.exp_year } : null,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to load invoices.' });
+  }
+});
+
 router.post('/checkout', async (req, res) => {
   try {
     if (!PLAN_IDS.has(req.body?.plan)) return res.status(400).json({ error: 'Select a current monthly plan.' });
