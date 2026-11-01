@@ -663,6 +663,8 @@ async function queueSnapshot(queue, jobId, stage) {
     stage,
     progress: job.progress || null,
     failed_reason: job.failedReason || null,
+    // When a worker picked the job up; the UI uses it to estimate time left.
+    started_at: job.processedOn ? new Date(job.processedOn).toISOString() : null,
   };
 }
 
