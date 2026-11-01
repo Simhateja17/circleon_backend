@@ -771,7 +771,7 @@ async function runApolloImport({ supabase, user, workspace, agentConfig, filters
 
     await reportProgress(finalStatus, {
       stage: pending ? 'waiting_for_enrichment' : 'completed',
-      stage_label: pending ? 'Waiting for email results' : (ready >= target ? 'Ready leads reached' : 'Lead search finished with partial results'),
+      stage_label: pending ? 'Waiting for email results' : (ready >= target ? 'Ready leads reached' : (searched === 0 ? 'No matching people found. Try broader roles, industry or company size.' : 'Lead search finished with partial results')),
       eta_seconds: pending ? 60 : 0,
       filters,
       requested_limit: target,

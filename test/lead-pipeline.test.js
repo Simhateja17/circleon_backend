@@ -83,3 +83,22 @@ test('campaign scheduler rolls excess emails into the next allowed day', () => {
   const second = nextAllowedSendAt(new Date(first.getTime() + 60_000), campaign, new Map([[key, 1]]));
   assert.notEqual(zonedParts(second, campaign.timezone).day, firstParts.day);
 });
+
+test('lead search maps company size labels to Apollo employee ranges', () => {
+  const { employeeRanges } = require('../lib/apollo');
+  assert.deepEqual(employeeRanges('1000+'), ['1000,1000000']);
+  assert.deepEqual(employeeRanges('1,000+ employees'), ['1000,1000000']);
+  assert.deepEqual(employeeRanges('201–1000'), ['201,1000']);
+  assert.deepEqual(employeeRanges('501-1,000 employees'), ['501,1000']);
+  assert.deepEqual(employeeRanges('11 to 50'), ['11,50']);
+  assert.deepEqual(employeeRanges('Enterprise'), []);
+  assert.deepEqual(employeeRanges(''), []);
+});
+
+test('lead search expands role categories into real job titles', () => {
+  const { expandTitles } = require('../lib/apollo');
+  const titles = expandTitles(['HR / People']);
+  assert.ok(titles.includes('HR Manager'));
+  assert.ok(!titles.includes('HR / People'));
+  assert.deepEqual(expandTitles(['Fleet Manager']), ['Fleet Manager']);
+});
