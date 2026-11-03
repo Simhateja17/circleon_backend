@@ -5,7 +5,7 @@ const { createServiceClient } = require('../lib/supabase');
 const { getRedisConnection } = require('../lib/redis');
 const { getBilling, isActiveSubscription } = require('../lib/billing');
 const { getAutopilotSettings, isCampaignIncluded } = require('../lib/autopilot');
-const { scheduleMessages } = require('../lib/campaignScheduling');
+const { completeCampaignIfFinished, isPermanentRecipientRejection, scheduleNextStep } = require('../lib/campaignFollowUps');
 const { getEmailSendQueue } = require('../lib/redis');
 const {
   appendTrackingPixel,
@@ -79,6 +79,18 @@ async function processSendJob(job) {
   const service = createServiceClient();
   if (!service) throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for email workers');
 
+  const result = await sendJobMessage(job, service);
+  // The email is already dealt with here, so a failed check must not retry the job.
+  try {
+    await completeCampaignIfFinished({ service, workspaceId: job.data.workspaceId, campaignId: job.data.campaignId });
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'campaign_completion_check_failed', campaignId: job.data.campaignId, error: error.message }));
+  }
+  return result;
+}
+
+async function sendJobMessage(job, service) {
+
   const { account, campaign, message, sequence } = await loadSendContext(service, job);
   const lead = message.leads;
   const isInboxReply = ['inbox_reply', 'manual_reply'].includes(message.raw_payload?.kind);
@@ -122,6 +134,8 @@ async function processSendJob(job) {
   }
 
   if (!['approved', 'draft'].includes(message.status)) {
+    // A retry lands here if the send worked but scheduling the next step did not.
+    if (message.status === 'sent' && !isInboxReply) await scheduleNextStep({ service, queue: getEmailSendQueue(), campaign, message });
     return { skipped: true, reason: `Message status is ${message.status}` };
   }
 
@@ -170,6 +184,14 @@ async function processSendJob(job) {
     attachments,
   }); } catch(error) {
     await service.rpc('release_email_usage',{wid:campaign.workspace_id,usage_key:usageKey});
+    if (!isInboxReply && isPermanentRecipientRejection(error)) {
+      const { error: failedError } = await service.from('messages').update({
+        status: 'failed',
+        raw_payload: { ...(message.raw_payload || {}), smtp_error: String(error.response || error.message) },
+      }).eq('id', message.id);
+      if (failedError) throw failedError;
+      return { skipped: true, reason: 'Recipient address was refused' };
+    }
     throw error;
   }
 
@@ -188,29 +210,9 @@ async function processSendJob(job) {
 
   if (error) throw error;
 
-  // Autopilot sequences continue only after a successful send. The next step
-  // remains queued with its configured delay and is still stopped by replies,
-  // opt-outs, bounces, or a campaign/workspace pause when its job executes.
-  if (!isInboxReply && campaign.autopilot_enabled) {
-    const nextStep = Number(message.sequence_step || 0) + 1;
-    const [{ data: nextMessage, error: nextMessageError }, { data: nextSequence, error: nextSequenceError }] = await Promise.all([
-      service.from('messages').select('id, lead_id, sequence_step').eq('workspace_id', campaign.workspace_id).eq('campaign_id', campaign.id).eq('lead_id', message.lead_id).eq('direction', 'outbound').eq('sequence_step', nextStep).eq('status', 'draft').is('scheduled_at', null).maybeSingle(),
-      service.from('email_sequences').select('delay_days').eq('campaign_id', campaign.id).eq('step_number', nextStep).maybeSingle(),
-    ]);
-    if (nextMessageError || nextSequenceError) throw nextMessageError || nextSequenceError;
-    if (nextMessage && nextSequence) {
-      const due = new Date(Date.now() + Math.max(0, Number(nextSequence.delay_days || 0)) * 24 * 60 * 60 * 1000);
-      await scheduleMessages({
-        supabase: service,
-        queue: getEmailSendQueue(),
-        workspaceId: campaign.workspace_id,
-        campaign,
-        messages: [nextMessage],
-        now: due,
-        reason: `Autopilot sequence step ${nextStep}`,
-      });
-    }
-  }
+  // The next step waits for its delay. When its job runs it is still stopped by
+  // a reply, an opt-out, or a campaign or workspace pause.
+  if (!isInboxReply) await scheduleNextStep({ service, queue: getEmailSendQueue(), campaign, message });
 
   return {
     sent: true,

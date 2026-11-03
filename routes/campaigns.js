@@ -14,6 +14,7 @@ const { requireActiveSubscription } = require('../lib/billing');
 const { createServiceClient } = require('../lib/supabase');
 const { scheduleMessages } = require('../lib/campaignScheduling');
 const { launchVoiceCampaign } = require('../lib/voiceLaunch');
+const { requeuePendingSteps } = require('../lib/campaignFollowUps');
 const { requestPhoneReveal } = require('../lib/apollo');
 
 const router = express.Router();
@@ -1109,6 +1110,7 @@ router.post('/:campaignId/pause', async (req, res) => {
       .update({ status: 'paused' })
       .eq('workspace_id', workspace.id)
       .eq('id', req.params.campaignId)
+      .neq('status', 'completed')
       .select('*')
       .maybeSingle();
 
@@ -1135,6 +1137,15 @@ router.post('/:campaignId/resume', async (req, res) => {
 
     if (error) throw error;
     if (!data) return res.status(404).json({ error: 'Paused campaign not found' });
+
+    // The campaign has already resumed, so a failure here should not report otherwise.
+    if (data.launched_at && data.channel !== 'voice') {
+      try {
+        await requeuePendingSteps({ db: req.supabase, queue: getEmailSendQueue(), campaign: data });
+      } catch (requeueError) {
+        console.error(JSON.stringify({ event: 'campaign_resume_requeue_failed', campaignId: data.id, error: requeueError.message }));
+      }
+    }
 
     return res.json({ campaign: data });
   } catch (error) {
