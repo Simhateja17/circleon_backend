@@ -11,6 +11,7 @@ const inboxRoutes = require('./routes/inbox');
 const callingRoutes = require('./routes/calling');
 const voiceRoutes = require('./routes/voice');
 const voiceAgentRoutes = require('./routes/voiceAgent');
+const singleCallRoutes = require('./routes/singleCall');
 const bookingRoutes = require('./routes/booking');
 const calendarOAuthRoutes = require('./routes/calendarOAuth');
 const aiRoutes = require('./routes/ai');
@@ -69,6 +70,7 @@ app.use('/api/calling', callingRoutes);
 // The agent's own endpoints are called by Retell mid-call, not the browser, so
 // they mount before the session-authenticated voice router.
 app.use('/api/voice/agent', voiceAgentRoutes);
+app.use('/api/voice/single-call', singleCallRoutes);
 app.use('/api/booking', bookingRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/api/calendar/google', calendarOAuthRoutes);

@@ -113,7 +113,7 @@ router.post('/book', async (req, res) => {
       .eq('id', call.workspace_id)
       .maybeSingle();
 
-    const { error: insertError } = await supabase.from('meetings').insert({
+    const { data: meeting, error: insertError } = await supabase.from('meetings').insert({
       workspace_id: call.workspace_id,
       campaign_id: call.campaign_id,
       lead_id: call.lead_id,
@@ -128,10 +128,14 @@ router.post('/book', async (req, res) => {
       ends_at: chosen.end,
       timezone: campaign?.timezone || 'Asia/Singapore',
       notes: 'Booked by an AI assistant during an outbound call.',
-    });
+    }).select('id').single();
     // The unique index caught another agent booking this time first.
     if (insertError?.code === '23505') return res.json({ booked: false, message: taken });
     if (insertError) throw insertError;
+
+    // So the Calls page can show the meeting alongside the call that booked it.
+    const { error: linkError } = await supabase.from('calls').update({ meeting_id: meeting.id }).eq('id', call.id);
+    if (linkError) console.error('[voice-agent] could not link meeting to call', call.id, linkError.message);
 
     return res.json({
       booked: true,

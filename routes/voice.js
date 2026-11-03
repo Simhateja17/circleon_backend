@@ -1007,6 +1007,7 @@ router.get('/campaigns/:campaignId/calls', async (req, res) => {
       .from('calls')
       .select('*, leads(id, full_name, company_name, title, phone_e164, phone_type), call_outcomes(outcome_type, summary, confidence)')
       .eq('campaign_id', campaign.id)
+      .eq('source', 'campaign')
       .order('created_at', { ascending: false })
       .limit(Math.min(Number(req.query.limit) || 100, 200));
 
