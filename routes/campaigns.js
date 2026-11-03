@@ -301,18 +301,27 @@ async function restoreUnassignedLeadLifecycle(req, workspaceId, leadIds) {
   const assigned = new Set((remaining || []).map(row => row.lead_id));
   const unassigned = leadIds.filter(id => !assigned.has(id));
   if (!unassigned.length) return;
-  const { error } = await req.supabase
-    .from('leads')
-    .update({ lifecycle_status: 'ready' })
-    .eq('workspace_id', workspaceId)
-    .eq('lifecycle_status', 'selected_for_campaign')
-    .in('id', unassigned);
-  if (error) throw error;
+  // "ready" means emailable, so a voice lead with no email goes back to candidate.
+  for (const [lifecycleStatus, hasEmail] of [['ready', true], ['candidate', false]]) {
+    const query = req.supabase
+      .from('leads')
+      .update({ lifecycle_status: lifecycleStatus })
+      .eq('workspace_id', workspaceId)
+      .eq('lifecycle_status', 'selected_for_campaign')
+      .in('id', unassigned);
+    const { error } = await (hasEmail ? query.not('email', 'is', null) : query.is('email', null));
+    if (error) throw error;
+  }
 }
 
-function leadBlockReason(lead) {
+function leadBlockReason(lead, channel = 'email') {
   if (!lead) return 'Lead was not found in this workspace';
   if (lead.dnc_status === 'blocked' || lead.lifecycle_status === 'suppressed') return 'Lead is suppressed and cannot be contacted';
+  if (channel === 'voice') {
+    // Apollo leads get their number looked up once they join a voice campaign.
+    const canGetPhone = lead.phone || lead.phone_e164 || (lead.source === 'apollo' && lead.external_id);
+    return canGetPhone ? null : 'Lead does not have a phone number';
+  }
   if (!lead.email) return 'Lead does not have a verified work email';
   if (!['ready', 'selected_for_campaign'].includes(lead.lifecycle_status)) return 'Lead is not ready for a campaign yet';
   return null;
@@ -462,7 +471,7 @@ router.put('/:campaignId/leads', async (req, res) => {
     }
     const leadsById = new Map(leads.map(lead => [lead.id, lead]));
     const ineligible = requestedIds
-      .map(leadId => ({ leadId, reason: leadBlockReason(leadsById.get(leadId)) }))
+      .map(leadId => ({ leadId, reason: leadBlockReason(leadsById.get(leadId), campaign.channel) }))
       .filter(item => item.reason);
     if (ineligible.length) {
       return res.status(400).json({
@@ -1155,3 +1164,4 @@ router.post('/:campaignId/resume', async (req, res) => {
 
 module.exports = router;
 module.exports.buildSendJobs = buildSendJobs;
+module.exports.leadBlockReason = leadBlockReason;
