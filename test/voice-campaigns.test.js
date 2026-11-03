@@ -17,7 +17,7 @@ const {
 } = require('../lib/dnc');
 
 const { billableCents } = require('../lib/callCredits');
-const { voiceCampaignState, requiresAttestation } = require('../lib/voiceCampaign');
+const { completeVoiceCampaignIfFinished, isVoiceCampaignFinished, voiceCampaignState, requiresAttestation } = require('../lib/voiceCampaign');
 
 const SG = 'Asia/Singapore';
 const campaignSchedule = {
@@ -235,4 +235,53 @@ test('the daily cap stops a campaign and names the reason', () => {
   }, wedMorningSGT);
 
   assert.equal(state.state, 'daily_cap');
+});
+
+test('a voice campaign finishes only when no lead is waiting or on a call', () => {
+  assert.equal(isVoiceCampaignFinished([]), false);
+  assert.equal(isVoiceCampaignFinished([{ state: 'pending' }]), false);
+  assert.equal(isVoiceCampaignFinished([{ state: 'completed' }, { state: 'in_flight' }]), false);
+  assert.equal(isVoiceCampaignFinished([{ state: 'completed' }, { state: 'exhausted' }, { state: 'blocked' }]), true);
+});
+
+function completionClient(targets) {
+  const updates = [];
+  return {
+    updates,
+    from(table) {
+      if (table === 'voice_call_targets') {
+        return { select: () => ({ eq: async () => ({ data: targets, error: null }) }) };
+      }
+      const filters = {};
+      const chain = {
+        update(patch) { updates.push({ patch, filters }); return chain; },
+        eq(column, value) { filters[column] = value; return chain; },
+        select: async () => ({ data: [{ id: filters.id }], error: null }),
+      };
+      return chain;
+    },
+  };
+}
+
+test('the last worked lead moves an active voice campaign to completed', async () => {
+  const client = completionClient([{ state: 'completed' }]);
+  assert.equal(await completeVoiceCampaignIfFinished(client, 'c1'), true);
+  assert.equal(client.updates.length, 1);
+  assert.equal(client.updates[0].patch.status, 'completed');
+  assert.ok(client.updates[0].patch.completed_at);
+  // Only an active campaign may finish, so a paused one stays paused.
+  assert.deepEqual(client.updates[0].filters, { id: 'c1', channel: 'voice', status: 'active' });
+});
+
+test('a lead still waiting keeps the voice campaign active', async () => {
+  const client = completionClient([{ state: 'completed' }, { state: 'pending' }]);
+  assert.equal(await completeVoiceCampaignIfFinished(client, 'c1'), false);
+  assert.equal(client.updates.length, 0);
+});
+
+test('a completed voice campaign reads as finished even if its script changed', () => {
+  const state = voiceCampaignState({ campaign: { status: 'completed' }, script: null, agent: null, telephony: null });
+  assert.equal(state.state, 'finished');
+  assert.equal(state.dialing, false);
+  assert.deepEqual(state.blockers, []);
 });

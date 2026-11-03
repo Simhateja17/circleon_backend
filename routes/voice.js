@@ -971,6 +971,7 @@ router.get('/campaigns/:campaignId/state', async (req, res) => {
     const spentCents = (spend || []).reduce((total, row) => total + (row.credit_charged_cents || 0), 0);
 
     return res.json({
+      campaign_status: campaign.status,
       state,
       window: callingWindowState({
         timezone: campaign.timezone,
