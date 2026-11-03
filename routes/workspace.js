@@ -57,7 +57,7 @@ Desired result: ${answerWithCustom(answers, 'vp', '-')}
 Common concern: ${answerWithCustom(answers, 'objections', '-')}
 Likely timing signal: ${answerWithCustom(answers, 'timingSignal', '-')}
 
-Write concise, truthful, personalized B2B emails. Use only supplied lead and company facts. Respect opt-outs immediately. Never invent praise, customer results, or urgency. Tone: ${answerWithCustom(answers, 'tone', 'Professional')}. Booking link: ${answerWithCustom(answers, 'calLink', '[Not set]')}.`;
+Write concise, truthful, personalized B2B emails. Use only supplied lead and company facts. Respect opt-outs immediately. Never invent praise, customer results, or urgency. Tone: ${answerWithCustom(answers, 'tone', 'Professional')}.`;
 }
 
 const { getOrCreateWorkspace } = require('../lib/workspace');
@@ -203,7 +203,7 @@ router.post('/onboarding-draft', async (req, res) => {
         value_proposition: getAnswer(answers, 'vp'),
         objections: getAnswer(answers, 'objections'),
         monthly_capacity: Number(getAnswer(answers, 'capacity', 20)),
-        booking_link: getAnswer(answers, 'calLink'),
+        booking_link: inHouseBookingLink(workspace),
         tone: getAnswer(answers, 'tone'),
         raw_answers: answers,
         system_prompt: generateSystemPrompt(answers),
@@ -260,7 +260,7 @@ router.post('/onboarding', async (req, res) => {
       value_proposition: getAnswer(answers, 'vp'),
       objections: getAnswer(answers, 'objections'),
       monthly_capacity: Number(getAnswer(answers, 'capacity', 20)),
-      booking_link: getAnswer(answers, 'calLink'),
+      booking_link: inHouseBookingLink(workspace),
       tone: getAnswer(answers, 'tone', 'Professional'),
       raw_answers: answers,
       system_prompt: systemPrompt,

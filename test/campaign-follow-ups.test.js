@@ -96,3 +96,10 @@ test('resume re-queues overdue steps and leaves the rest alone', async () => {
   assert.deepEqual(queue.jobs.map(job => job.data.messageId).sort(), ['chain-2', 'early-2', 'overdue-1']);
   assert.equal(queue.removed.length, 3);
 });
+
+test('a booked meeting stops the lead', () => {
+  const booked = { leads: { meetings: [{ status: 'scheduled' }] } };
+  assert.equal(pendingSteps([step('a', 1, 'sent', booked), step('a', 2, 'approved', booked)], manual).length, 0);
+  const canceled = { leads: { meetings: [{ status: 'canceled' }] } };
+  assert.equal(pendingSteps([step('a', 1, 'sent', canceled), step('a', 2, 'approved', canceled)], manual).length, 1);
+});

@@ -133,6 +133,17 @@ async function sendJobMessage(job, service) {
     return { skipped: true, reason: 'Lead already replied' };
   }
 
+  if (!isInboxReply) {
+    const { count: bookedMeetings, error: bookedError } = await service
+      .from('meetings')
+      .select('id', { count: 'exact', head: true })
+      .eq('workspace_id', campaign.workspace_id)
+      .eq('lead_id', lead.id)
+      .eq('status', 'scheduled');
+    if (bookedError) throw bookedError;
+    if (bookedMeetings) return { skipped: true, reason: 'Lead already booked a meeting' };
+  }
+
   if (!['approved', 'draft'].includes(message.status)) {
     // A retry lands here if the send worked but scheduling the next step did not.
     if (message.status === 'sent' && !isInboxReply) await scheduleNextStep({ service, queue: getEmailSendQueue(), campaign, message });
