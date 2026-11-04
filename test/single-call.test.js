@@ -112,6 +112,32 @@ test('outside hours nothing dials until the user chooses to schedule', async () 
   assert.equal(call.scheduled_for, '2026-09-17T01:00:00.000Z');
 });
 
+test('outside hours the user can choose to call immediately', async () => {
+  let dialled = 0;
+  const dial = async () => { dialled += 1; return { call_id: 'retell-1' }; };
+  const db = fakeDb({ leads: lead, calls: [] });
+
+  const call = await startSingleCall(db, { ...startArgs, callNow: true, now: wedNight }, { loadSetup: async () => setup, credit: okCredit, countActive: async () => 0, dial });
+
+  assert.equal(dialled, 1);
+  assert.equal(call.status, 'calling');
+  assert.equal(call.scheduled_for, undefined);
+});
+
+test('calling immediately still stops for a blocked lead and the plan limit', async () => {
+  const dial = async () => assert.fail('must not dial');
+
+  await assert.rejects(
+    startSingleCall(fakeDb({ leads: { ...lead, status: 'do_not_call' }, calls: [] }), { ...startArgs, callNow: true, now: wedNight }, { loadSetup: async () => setup, credit: okCredit, dial }),
+    /asked not to be called/,
+  );
+
+  await assert.rejects(
+    startSingleCall(fakeDb({ leads: lead, calls: [] }), { ...startArgs, callNow: true, now: wedNight }, { loadSetup: async () => setup, credit: okCredit, countActive: async () => 99, dial }),
+    /most calls your plan allows/,
+  );
+});
+
 test('a blocked lead never reaches the dialler', async () => {
   const db = fakeDb({ leads: { ...lead, status: 'do_not_call' }, calls: [] });
   await assert.rejects(

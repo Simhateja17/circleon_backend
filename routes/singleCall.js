@@ -20,6 +20,7 @@ const startSchema = z.object({
   campaign_id: uuid,
   confirmed: z.literal(true),
   schedule: z.boolean().optional(),
+  call_now: z.boolean().optional(),
 });
 
 function first(value) {
@@ -160,6 +161,7 @@ router.post('/', async (req, res) => {
       leadId: parsed.data.lead_id,
       campaignId: parsed.data.campaign_id,
       schedule: parsed.data.schedule,
+      callNow: parsed.data.call_now,
       schedulingAvailable: schedulingAvailable(),
     });
     return res.status(201).json({ call });
