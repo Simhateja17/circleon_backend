@@ -138,6 +138,16 @@ test('calling immediately still stops for a blocked lead and the plan limit', as
   );
 });
 
+test('a number outside Singapore is not allowed, even with consent', async () => {
+  const abroad = { ...lead, phone_e164: '+916300000000', voice_consent_status: 'consented' };
+  const db = fakeDb({ leads: abroad, calls: [] });
+  await assert.rejects(
+    startSingleCall(db, { ...startArgs, callNow: true, now: wedMorning }, { loadSetup: async () => setup, credit: okCredit, dial: async () => assert.fail('must not dial') }),
+    /not allowed/,
+  );
+  assert.equal(db.writes.length, 0);
+});
+
 test('a blocked lead never reaches the dialler', async () => {
   const db = fakeDb({ leads: { ...lead, status: 'do_not_call' }, calls: [] });
   await assert.rejects(
