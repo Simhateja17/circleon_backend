@@ -897,7 +897,34 @@ router.get('/campaigns/:campaignId/coverage', async (req, res) => {
         phone_e164: lead.phone_e164 || lead.phone,
       }));
 
-    return res.json({ coverage, company_warnings: warnings, unclassified });
+    // One row per lead with where it sits in the queue. A lead has no target
+    // until the campaign launches.
+    const { data: targets, error: targetError } = await req.supabase
+      .from('voice_call_targets')
+      .select('lead_id, state, attempts, block_reason')
+      .eq('campaign_id', campaign.id)
+      .eq('workspace_id', workspace.id);
+    if (targetError) throw targetError;
+    const targetByLead = new Map((targets || []).map(target => [target.lead_id, target]));
+
+    const leadRows = leads.map(lead => {
+      const target = targetByLead.get(lead.id);
+      return {
+        id: lead.id,
+        full_name: lead.full_name,
+        title: lead.title,
+        company_name: lead.company_name,
+        phone_e164: lead.phone_e164 || lead.phone,
+        phone_type: lead.phone_type,
+        dnc_status: lead.dnc_status,
+        voice_consent_status: lead.voice_consent_status,
+        target_state: target?.state || null,
+        attempts: target?.attempts || 0,
+        block_reason: target?.block_reason || null,
+      };
+    });
+
+    return res.json({ coverage, company_warnings: warnings, unclassified, leads: leadRows });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Could not summarise this campaign' });
   }
