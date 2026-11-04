@@ -442,6 +442,8 @@ async function applyApolloUpdates(supabase, updates) {
       const discarded = !pending && ready >= target
         ? await discardUnadmittedEnrichingLeads(supabase, run, 'Target reached before verified work email was returned')
         : 0;
+      // Top-up batches are requested here, after the worker has stopped reporting progress.
+      const { count: requestedCount } = await supabase.from('apollo_enrichment_requests').select('id', { count: 'exact', head: true }).eq('import_run_id', runId);
       await updateImportRun(supabase, runId, {
         status: (pending || hasMore) ? 'pending_enrichment' : (ready >= target ? 'completed' : 'partial'),
         completed_at: (pending || hasMore) ? null : new Date().toISOString(),
@@ -458,6 +460,7 @@ async function applyApolloUpdates(supabase, updates) {
           last_webhook_at: new Date().toISOString(),
           ready_count: ready,
           pending_count: pending,
+          enrichment_requested_count: requestedCount ?? (run.raw_meta || {}).enrichment_requested_count ?? 0,
           not_admitted_count: ((run.raw_meta || {}).not_admitted_count || 0) + discarded,
           target_overflow_discarded: ((run.raw_meta || {}).target_overflow_discarded || 0) + overflow,
           latest_top_up_request_ids: topUp.requestIds,
