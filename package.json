@@ -12,6 +12,7 @@
     "worker:lead-research": "node workers/lead-research.worker.js",
     "worker:autopilot": "node workers/autopilot.worker.js",
     "worker:billing": "node workers/billing.worker.js",
+    "worker:invoices": "node workers/invoice-followup.worker.js",
     "billing:configure-prices": "node scripts/configure-monthly-prices.js",
     "billing:configure-portal": "node scripts/configure-monthly-portal.js",
     "billing:check": "node scripts/check-monthly-readiness.js"
