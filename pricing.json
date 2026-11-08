@@ -1,5 +1,68 @@
 [
   {
+    "id": "email",
+    "family": "email",
+    "tier": "starter",
+    "name": "Email",
+    "list": 399,
+    "founding": 349,
+    "setup": 650,
+    "leads": 500,
+    "emails": 2000,
+    "minutes": 0,
+    "seats": 1,
+    "campaigns": 1,
+    "concurrency": 0,
+    "lookup": "aio_starter",
+    "features": [
+      "leads",
+      "email"
+    ]
+  },
+  {
+    "id": "email_invoice",
+    "family": "email_invoice",
+    "tier": "growth",
+    "name": "Email + Invoice",
+    "list": 649,
+    "founding": 549,
+    "setup": 650,
+    "leads": 800,
+    "emails": 3200,
+    "minutes": 0,
+    "seats": 3,
+    "campaigns": 3,
+    "concurrency": 0,
+    "lookup": "aio_growth",
+    "features": [
+      "leads",
+      "email",
+      "invoices"
+    ]
+  },
+  {
+    "id": "all_in_one",
+    "family": "allinone",
+    "tier": "pro",
+    "name": "All-in-one",
+    "list": 999,
+    "founding": 919,
+    "setup": 650,
+    "leads": 1500,
+    "emails": 6000,
+    "minutes": 600,
+    "seats": 5,
+    "campaigns": 10,
+    "concurrency": 3,
+    "lookup": "aio_pro",
+    "features": [
+      "leads",
+      "email",
+      "invoices",
+      "voice"
+    ]
+  },
+  {
     "id": "followup_starter",
     "family": "followup",
     "tier": "starter",
@@ -13,7 +76,12 @@
     "seats": 1,
     "campaigns": 1,
     "concurrency": 0,
-    "lookup": "fu_starter"
+    "lookup": "fu_starter",
+    "features": [
+      "leads",
+      "email"
+    ],
+    "retired": true
   },
   {
     "id": "followup_growth",
@@ -29,7 +97,12 @@
     "seats": 3,
     "campaigns": 3,
     "concurrency": 0,
-    "lookup": "fu_growth"
+    "lookup": "fu_growth",
+    "features": [
+      "leads",
+      "email"
+    ],
+    "retired": true
   },
   {
     "id": "followup_pro",
@@ -45,7 +118,12 @@
     "seats": 5,
     "campaigns": 10,
     "concurrency": 0,
-    "lookup": "fu_pro"
+    "lookup": "fu_pro",
+    "features": [
+      "leads",
+      "email"
+    ],
+    "retired": true
   },
   {
     "id": "voice_starter",
@@ -61,7 +139,11 @@
     "seats": 1,
     "campaigns": null,
     "concurrency": 1,
-    "lookup": "va_starter"
+    "lookup": "va_starter",
+    "retired": true,
+    "features": [
+      "voice"
+    ]
   },
   {
     "id": "voice_growth",
@@ -77,7 +159,11 @@
     "seats": 3,
     "campaigns": null,
     "concurrency": 2,
-    "lookup": "va_growth"
+    "lookup": "va_growth",
+    "retired": true,
+    "features": [
+      "voice"
+    ]
   },
   {
     "id": "voice_pro",
@@ -93,7 +179,11 @@
     "seats": 5,
     "campaigns": null,
     "concurrency": 3,
-    "lookup": "va_pro"
+    "lookup": "va_pro",
+    "retired": true,
+    "features": [
+      "voice"
+    ]
   },
   {
     "id": "allinone_starter",
@@ -109,7 +199,14 @@
     "seats": 1,
     "campaigns": 1,
     "concurrency": 1,
-    "lookup": "aio_starter"
+    "lookup": "aio_starter",
+    "features": [
+      "leads",
+      "email",
+      "invoices",
+      "voice"
+    ],
+    "retired": true
   },
   {
     "id": "allinone_growth",
@@ -125,7 +222,14 @@
     "seats": 3,
     "campaigns": 3,
     "concurrency": 2,
-    "lookup": "aio_growth"
+    "lookup": "aio_growth",
+    "features": [
+      "leads",
+      "email",
+      "invoices",
+      "voice"
+    ],
+    "retired": true
   },
   {
     "id": "allinone_pro",
@@ -141,6 +245,13 @@
     "seats": 5,
     "campaigns": 10,
     "concurrency": 3,
-    "lookup": "aio_pro"
+    "lookup": "aio_pro",
+    "features": [
+      "leads",
+      "email",
+      "invoices",
+      "voice"
+    ],
+    "retired": true
   }
 ]

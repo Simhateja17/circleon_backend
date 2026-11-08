@@ -73,8 +73,11 @@ router.post('/change-plan', wrap(async (req, res) => {
   const w = await owner(req), db=m.service(), b = await getBilling(req.supabase,w.id), next=byId[req.body.plan], old=byId[b?.plan];
   if (!old || !next || b.subscription_status !== 'active' || b.payment_failed) throw new Error('Changes require an active paid monthly subscription. Legacy customers require an agreed migration.');
   if (old.id===next.id) throw new Error('You already have this plan.');
-  // Cross-family migrations change setup/voice readiness and need operator review.
-  if (old.family!==next.family) throw new Error('Contact CircleOn to change plan families.');
+  // Email, Email + Invoice and All-in-one share one setup fee and price set, so
+  // owners move between them freely. Moving onto or off a retired plan family
+  // changes setup/voice readiness and still needs operator review.
+  if (next.retired && !old.retired) throw new Error('That plan is no longer offered.');
+  if (old.family!==next.family && (old.retired || next.retired)) throw new Error('Contact CircleOn to change plan families.');
   const downgrade = next.list<old.list;
   if (downgrade) {
     const keepMembers=req.body.keep_member_ids, keepCampaigns=req.body.keep_campaign_ids;

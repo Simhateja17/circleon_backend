@@ -22,6 +22,8 @@ const freeLeadPreviewRoutes = require('./routes/freeLeadPreview');
 const documentRoutes = require('./routes/documents');
 const adminRoutes = require('./routes/admin');
 const supportRoutes = require('./routes/support');
+const invoiceRoutes = require('./routes/invoices');
+const { startInvoiceFollowUps } = require('./workers/invoice-followup.worker');
 const { router: billingRoutes, handleWebhook: stripeWebhookHandler } = require('./routes/billing');
 const { startVoiceQueue } = require('./lib/voiceCampaignQueue');
 const { resumeQueuedAgentLaunchJobs } = require('./lib/agentLaunch');
@@ -82,6 +84,7 @@ app.use('/api/documents', documentRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/support', supportRoutes);
+app.use('/api/invoices', invoiceRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -136,6 +139,12 @@ app.listen(PORT, () => {
     }
   } else {
     console.log('[free-lead-preview-worker] in-process worker disabled');
+  }
+  const runInvoiceWorkerInProcess = process.env.INVOICE_WORKER_ENABLED === 'true'
+    || (process.env.INVOICE_WORKER_ENABLED !== 'false' && process.env.NODE_ENV !== 'production');
+  if (runInvoiceWorkerInProcess) {
+    startInvoiceFollowUps();
+    console.log('[invoice-followup-worker] running in this process');
   }
   startVoiceQueue();
   startAutopilotScheduler();

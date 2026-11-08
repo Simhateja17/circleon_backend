@@ -1054,7 +1054,7 @@ router.put('/inbound-context', async (req,res)=>{
     const workspace=await getOrCreateWorkspace(req.supabase,req.user);
     if(workspace.owner_id!==req.user.id)return res.status(403).json({error:'Only the workspace owner approves inbound context.'});
     const {data:billing,error:billingError}=await req.supabase.from('workspace_billing').select('plan,subscription_status,payment_failed').eq('workspace_id',workspace.id).single();if(billingError)throw billingError;
-    if(!['voice_starter','voice_growth','voice_pro','allinone_starter','allinone_growth','allinone_pro'].includes(billing.plan)||billing.subscription_status!=='active'||billing.payment_failed)return res.status(400).json({error:'An active paid monthly voice plan is required.'});
+    if(!require('../lib/entitlements').hasFeature(billing.plan,'voice')||!require('../lib/pricing').byId[billing.plan]||billing.subscription_status!=='active'||billing.payment_failed)return res.status(400).json({error:'An active paid monthly voice plan is required.'});
     const parsed=z.object({prompt:z.string().trim().min(20).max(20000),opening_line:z.string().trim().min(10).max(1000),approved:z.literal(true),language:z.enum(['en-US','en-GB','zh-CN']).default('en-US')}).safeParse(req.body);
     if(!parsed.success)return res.status(400).json({error:'Review and explicitly approve the inbound prompt and AI disclosure opening line.'});
     const {data:agentConfig,error:configError}=await req.supabase.from('agent_configs').select('*').eq('workspace_id',workspace.id).maybeSingle();if(configError)throw configError;
