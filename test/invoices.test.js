@@ -75,3 +75,18 @@ test('the worker skips workspaces whose plan lacks invoicing', async () => {
   const db = { from(table) { const q = { select: () => q, or: () => q, limit: async () => ({ data: tables[table], error: null }), eq: () => q, maybeSingle: async () => ({ data: tables[table][0], error: null }) }; return q; } };
   assert.deepEqual(await runInvoiceFollowUps(db, { now: at('2026-11-25') }), { sent: 0 });
 });
+
+test('emails carry a CircleOn-styled HTML version with the same facts', () => {
+  const invoice = { ...sent, issue_date: '2026-11-01', notes: '<script>x</script>', line_items: [{ description: 'Design & build', quantity: 2, unit_cents: 75000 }] };
+  const { subject, body, html } = composeEmail('invoice', invoice, { businessName: 'Acme' });
+  assert.match(subject, /S\$1,500\.00 due 20 Nov 2026$/);
+  assert.match(body, /Due: 20 Nov 2026/);
+  assert.match(html, /S\$1,500\.00/);
+  assert.match(html, /Awaiting payment/);
+  assert.match(html, /Design &amp; build/);
+  assert.match(html, /Sent with/);
+  assert.ok(!html.includes('<script>x'));
+  assert.match(composeEmail('reminder', sent, { offset: 7 }).html, /Overdue by 7 days/);
+  const review = composeEmail('checkin', sent, { offset: 30, reviewLink: 'javascript:alert(1)' }).html;
+  assert.ok(!review.includes('javascript:'));
+});

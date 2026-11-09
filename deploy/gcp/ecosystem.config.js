@@ -151,6 +151,22 @@ module.exports = {
       kill_timeout: 10000,
     },
     {
+      // Payment reminders and post-sale check-ins. Exactly one instance.
+      name: 'barsha-invoice-followup-worker',
+      script: './workers/invoice-followup.worker.js',
+      cwd: '/opt/barsha-backend',
+      instances: 1,
+      exec_mode: 'fork',
+      env: { NODE_ENV: 'production' },
+      error_file: '/var/log/barsha-backend/invoice-followup-worker-err.log',
+      out_file: '/var/log/barsha-backend/invoice-followup-worker-out.log',
+      time: true,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      kill_timeout: 10000,
+    },
+    {
       name: 'barsha-poll-inbox-worker',
       script: './workers/poll-inbox.worker.js',
       cwd: '/opt/barsha-backend',
