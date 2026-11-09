@@ -5,6 +5,7 @@ const { suggestTargetTerms } = require('../lib/gemini');
 const { getBilling, isActiveSubscription, requireActiveSubscription } = require('../lib/billing');
 const { ensureSuggestedCampaigns } = require('../lib/autopilot');
 const { applyTourPatch, normalizeTourState } = require('../lib/tourState');
+const { inHouseBookingLink } = require('../lib/inHouseCalendar');
 
 const router = express.Router();
 
