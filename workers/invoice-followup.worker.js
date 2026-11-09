@@ -1,10 +1,13 @@
-// Sends payment reminders and post-sale check-ins. Run exactly one instance in
+// Sends payment reminders, post-sale check-ins and booking reminders. Run exactly one instance in
 // production (npm run worker:invoices); in development it runs inside server.js.
 require('dotenv').config();
 const { createServiceClient } = require('../lib/supabase');
 const { runInvoiceFollowUps } = require('../lib/invoices');
+const { runBookingReminders } = require('../lib/bookingReminders');
 
-const INTERVAL_MS = Number(process.env.INVOICE_WORKER_INTERVAL_MS || 15 * 60 * 1000);
+// Booking reminders are timed to the minute ("3 hours before"), so the worker
+// runs every five minutes; payment follow-ups are idempotent per step.
+const INTERVAL_MS = Number(process.env.INVOICE_WORKER_INTERVAL_MS || 5 * 60 * 1000);
 
 function startInvoiceFollowUps() {
   const db = createServiceClient();
@@ -21,6 +24,12 @@ function startInvoiceFollowUps() {
       if (sent) console.log(`[invoice-followup-worker] sent ${sent} follow-up email(s)`);
     } catch (error) {
       console.error('[invoice-followup-worker]', error.message);
+    }
+    try {
+      const { sent } = await runBookingReminders(db);
+      if (sent) console.log(`[invoice-followup-worker] sent ${sent} booking reminder(s)`);
+    } catch (error) {
+      console.error('[invoice-followup-worker] booking reminders', error.message);
     } finally {
       running = false;
     }
