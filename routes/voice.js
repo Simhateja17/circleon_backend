@@ -11,6 +11,7 @@ const {
   importPhoneNumber,
   listVoices,
   supportedLanguages,
+  LANGUAGE_CODES,
 } = require('../lib/retellVoice');
 const {
   checkNumbersWithPdpc,
@@ -643,7 +644,7 @@ router.delete('/calendar', async (req, res) => {
 // ---------------------------------------------------------------------------
 
 const scriptSchema = z.object({
-  language: z.enum(['en-US', 'en-GB', 'zh-CN']).optional(),
+  language: z.enum(LANGUAGE_CODES).optional(),
   opening_line: z.string().trim().max(400).nullable().optional(),
   objective: z.string().trim().max(600).nullable().optional(),
   offer: z.string().trim().max(1200).nullable().optional(),
@@ -737,6 +738,7 @@ router.post('/campaigns/:campaignId/script/generate', async (req, res) => {
     if (!context) return res.status(404).json({ error: 'Voice campaign not found' });
 
     const language = req.body.language || context.script?.language || 'en-US';
+    if (!LANGUAGE_CODES.includes(language)) return res.status(400).json({ error: `Unsupported language: ${language}` });
 
     await req.supabase
       .from('voice_scripts')
@@ -1055,7 +1057,7 @@ router.put('/inbound-context', async (req,res)=>{
     if(workspace.owner_id!==req.user.id)return res.status(403).json({error:'Only the workspace owner approves inbound context.'});
     const {data:billing,error:billingError}=await req.supabase.from('workspace_billing').select('plan,subscription_status,payment_failed').eq('workspace_id',workspace.id).single();if(billingError)throw billingError;
     if(!require('../lib/entitlements').hasFeature(billing.plan,'voice')||!require('../lib/pricing').byId[billing.plan]||billing.subscription_status!=='active'||billing.payment_failed)return res.status(400).json({error:'An active paid monthly voice plan is required.'});
-    const parsed=z.object({prompt:z.string().trim().min(20).max(20000),opening_line:z.string().trim().min(10).max(1000),approved:z.literal(true),language:z.enum(['en-US','en-GB','zh-CN']).default('en-US')}).safeParse(req.body);
+    const parsed=z.object({prompt:z.string().trim().min(20).max(20000),opening_line:z.string().trim().min(10).max(1000),approved:z.literal(true),language:z.enum(LANGUAGE_CODES).default('en-US')}).safeParse(req.body);
     if(!parsed.success)return res.status(400).json({error:'Review and explicitly approve the inbound prompt and AI disclosure opening line.'});
     const {data:agentConfig,error:configError}=await req.supabase.from('agent_configs').select('*').eq('workspace_id',workspace.id).maybeSingle();if(configError)throw configError;
     const script={status:'approved',custom_prompt:parsed.data.prompt,opening_line:parsed.data.opening_line,language:parsed.data.language};

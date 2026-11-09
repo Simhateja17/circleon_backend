@@ -285,3 +285,26 @@ test('a completed voice campaign reads as finished even if its script changed', 
   assert.equal(state.dialing, false);
   assert.deepEqual(state.blockers, []);
 });
+
+test('Singapore languages: Malay, Tamil and Hindi are supported end to end', () => {
+  const { retellLanguage, LANGUAGE_CODES } = require('../lib/retellVoice');
+  const { composeOpeningLine, composeVoicePrompt } = require('../lib/voiceScript');
+  for (const code of ['zh-CN', 'ms-MY', 'ta-IN', 'hi-IN']) {
+    assert.ok(LANGUAGE_CODES.includes(code));
+    assert.equal(retellLanguage(code), code);
+    assert.equal(requiresAttestation(code), true);
+  }
+  assert.match(composeOpeningLine({ openingLine: 'x', agentName: 'Aisha', companyName: 'Acme', language: 'ms-MY' }), /Aisha dari Acme\. Saya seorang pembantu AI\. Panggilan ini dirakam\. x$/);
+  assert.match(composeOpeningLine({ agentName: 'Aisha', companyName: 'Acme', language: 'ta-IN' }), /AI உதவியாளர்/);
+  assert.match(composeOpeningLine({ agentName: 'Aisha', companyName: 'Acme', language: 'hi-IN' }), /AI सहायक/);
+  assert.match(composeVoicePrompt({ script: { language: 'ta-IN' } }), /^# LANGUAGE\nSpeak only in Tamil/);
+  assert.doesNotMatch(composeVoicePrompt({ script: { language: 'en-US' } }), /# LANGUAGE/);
+});
+
+test('opening line names the company first, then discloses AI, then recording', () => {
+  const { composeOpeningLine } = require('../lib/voiceScript');
+  assert.equal(
+    composeOpeningLine({ openingLine: 'Do you have a minute?', agentName: 'Aisha', companyName: 'Acme', language: 'en-US' }),
+    "Hi, this is Aisha calling from Acme. I'm an AI assistant. This call is recorded. Do you have a minute?",
+  );
+});
